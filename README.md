@@ -4,6 +4,12 @@
 It loads a local PDF, lets you ask natural-language questions, and can save responses to
 Markdown or PDF for reporting and handoff.
 
+## Repository Description
+
+Use this as the short repository description:
+
+`CLI PDF retrieval tool using Recursive Language Models (RLM), with optional depth-1 subagent routing and markdown/PDF export.`
+
 The project is designed to stay practical:
 - minimal setup
 - explicit backend/key handling
@@ -89,7 +95,8 @@ uv run main.py
    - enable/disable subagents
    - optionally load `prompts.md`
    - choose one-time mode or allow follow-up queries
-   - enter your question
+   - if a default query is loaded, choose whether to use it
+   - otherwise enter your question
    - optionally save response
 
 While a query is running, the CLI shows a live spinner + elapsed time.
@@ -117,6 +124,8 @@ Parser behavior:
 - supports section names like `System` and `Query` (case-insensitive lookup in CLI)
 - ignores missing files by returning an empty prompt map
 - in subagent mode, your `System` text is appended to the built-in RLM system prompt
+- when a default query is loaded, the CLI asks for explicit confirmation (`Use loaded default query?`)
+- accidental yes/no text input in query mode is guarded and re-prompted
 
 ## Execution Modes
 
@@ -151,6 +160,7 @@ Example:
 Requirements:
 - both `RLM_SUBAGENT_BACKEND` and `RLM_SUBAGENT_MODEL` can be pre-set in `.env`, or entered interactively
 - the selected subagent backend must have a valid API key in `.env`
+- when both subagent env vars are set, the interactive "different backend/model" prompt defaults to `yes`
 
 ## Output Saving
 
@@ -167,7 +177,9 @@ All saved files are written under the project `response/` directory.
 Run all current tests:
 
 ```bash
+uv run python -m pytest -q
 uv run python tests/verify_retrieval.py
+uv run python tests/test_main_query_prompt.py
 uv run python tests/test_prompt_loader.py
 uv run python tests/test_pdf_gen.py
 ```
@@ -175,6 +187,7 @@ uv run python tests/test_pdf_gen.py
 Test coverage includes:
 - PDF listing and extraction behavior
 - RLM/direct-LM call routing and payload format
+- query prompt UX behavior (default query and one-time/follow-up control)
 - prompt file parsing
 - markdown/PDF output generation
 - runtime metrics aggregation for direct and subagent modes
