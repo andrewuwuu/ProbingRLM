@@ -1,5 +1,5 @@
 [project]
-name = "rlm-test"
+name = "ProbingRLM"
 version = "0.1.0"
 description = "CLI PDF retrieval tool built on the rlms library."
 readme = "README.md"
