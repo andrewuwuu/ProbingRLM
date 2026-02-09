@@ -1,5 +1,6 @@
 # Python-generated files
 __pycache__/
+.pytest_cache/
 *.py[oc]
 build/
 dist/
@@ -18,4 +19,3 @@ embed-docs/
 
 # response files
 response/
-

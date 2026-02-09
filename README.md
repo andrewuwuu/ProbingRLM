@@ -1,6 +1,6 @@
 # RLM PDF Retrieval Tool
 
-`rlm-test` is a terminal-based PDF question-answering tool built on the `rlms` library.
+`ProbeRLM` is a terminal-based PDF question-answering tool built on the `rlms` library.
 It loads a local PDF, lets you ask natural-language questions, and can save responses to
 Markdown or PDF for reporting and handoff.
 
