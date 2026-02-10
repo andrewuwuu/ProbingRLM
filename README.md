@@ -1,8 +1,8 @@
 # ProbingRLM
 
-`ProbingRLM` is a terminal-based PDF question-answering tool built on the `rlms` library.
-It loads a local PDF, lets you ask natural-language questions, and can save responses to
-Markdown or PDF for reporting and handoff.
+`ProbingRLM` is a terminal-based document question-answering tool built on the `rlms` library.
+It loads local documents (PDF, DOCX, TXT, MD, and text-like files), lets you ask
+natural-language questions, and can save responses to Markdown or PDF for reporting and handoff.
 
 The project is designed to stay practical:
 - minimal setup
@@ -12,8 +12,8 @@ The project is designed to stay practical:
 
 ## What It Does
 
-- Scans `embed-docs/` for PDF files.
-- Extracts PDF text using `pypdf`.
+- Scans `embed-docs/` for supported document files.
+- Extracts text from PDF, DOCX, and plain text files.
 - Sends your query plus document context to an LLM via `rlms`.
 - Supports both direct LM mode and RLM subagent mode.
 - Optionally loads reusable prompts from `prompts.md`.
@@ -25,7 +25,7 @@ The CLI entrypoint is `main.py`.
 
 1. Environment variables are loaded from `.env`.
 2. Backend and API key are resolved (`openrouter` or `openai`).
-3. You pick a PDF and model.
+3. You pick document(s) and model.
 4. You choose execution mode:
    - direct LM mode (`use_subagents = false`)
    - RLM subagent mode (`use_subagents = true`)
@@ -35,7 +35,7 @@ The CLI entrypoint is `main.py`.
 Implementation files:
 - `main.py`: interactive flow and orchestration
 - `src/rlm_handler.py`: backend/model calls and RLM behavior
-- `src/pdf_utils.py`: file discovery + PDF text extraction
+- `src/pdf_utils.py`: document discovery + text extraction
 - `src/prompt_loader.py`: markdown prompt section parsing
 - `src/output_utils.py`: markdown/PDF output writing
 - `tests/`: behavior checks for retrieval, prompts, and output generation
@@ -75,7 +75,8 @@ If `RLM_BACKEND` is omitted, the app prefers OpenRouter when both keys exist.
 
 ## Quick Start
 
-1. Put one or more PDFs in `embed-docs/`.
+1. Put one or more documents in `embed-docs/`.
+   Supported types include `.pdf`, `.docx`, `.txt`, `.md`, and other text-like files.
 2. Run:
 
 ```bash
@@ -83,8 +84,8 @@ uv run main.py
 ```
 
 3. Follow prompts:
-   - choose a PDF by number
-   - or choose `a` to load all PDFs in `embed-docs/`
+   - choose a document by number
+   - or choose `a` to load all documents in `embed-docs/`
    - choose model (or accept default)
    - enable/disable subagents
    - optionally load `prompts.md`
@@ -173,7 +174,7 @@ uv run python tests/test_pdf_gen.py
 ```
 
 Test coverage includes:
-- PDF listing and extraction behavior
+- document listing and extraction behavior
 - RLM/direct-LM call routing and payload format
 - prompt file parsing
 - markdown/PDF output generation
@@ -185,8 +186,8 @@ Test coverage includes:
   - Set `OPENROUTER_API_KEY` or `OPENAI_API_KEY` in `.env`.
 - `RLM_BACKEND=... but ..._API_KEY is missing`:
   - Either add the matching key or change `RLM_BACKEND`.
-- `No PDF files found in 'embed-docs/'`:
-  - Add at least one `.pdf` into `embed-docs/`.
+- `No supported documents found in 'embed-docs/'`:
+  - Add files such as `.pdf`, `.docx`, `.txt`, or `.md` into `embed-docs/`.
 - Empty or weak answers:
   - Try a stronger model, add a `System` prompt, or enable subagents.
 

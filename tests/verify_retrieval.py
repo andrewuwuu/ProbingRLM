@@ -13,6 +13,29 @@ from src import rlm_handler
 
 
 class TestPDFRetrieval(unittest.TestCase):
+    def test_list_documents_includes_supported_and_text_like_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = {
+                "paper.pdf": b"%PDF-1.7\nfake\n",
+                "notes.md": b"# Notes\nhello\n",
+                "readme.txt": b"plain text\n",
+                "draft.docx": b"PK\x03\x04fake-docx-binary",
+                "noext": b"just some text with no extension",
+                "image.bin": b"\x00\x01\x02\x03\x04",
+            }
+            for name, content in files.items():
+                with open(os.path.join(tmpdir, name), "wb") as handle:
+                    handle.write(content)
+
+            listed = pdf_utils.list_documents(tmpdir)
+
+            self.assertIn("paper.pdf", listed)
+            self.assertIn("notes.md", listed)
+            self.assertIn("readme.txt", listed)
+            self.assertIn("draft.docx", listed)
+            self.assertIn("noext", listed)
+            self.assertNotIn("image.bin", listed)
+
     def test_list_pdfs_sorted_case_insensitive(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             for name in ["b.pdf", "a.PDF", "ignore.txt"]:
@@ -34,6 +57,29 @@ class TestPDFRetrieval(unittest.TestCase):
 
         self.assertEqual(text, "Page text\nPage text")
         mock_pdf_reader.assert_called_with("dummy.pdf")
+
+    @patch("src.pdf_utils.load_pdf")
+    def test_load_document_routes_pdf(self, mock_load_pdf):
+        mock_load_pdf.return_value = "pdf text"
+        result = pdf_utils.load_document("sample.pdf")
+        self.assertEqual(result, "pdf text")
+        mock_load_pdf.assert_called_once_with("sample.pdf")
+
+    @patch("src.pdf_utils._load_docx")
+    def test_load_document_routes_docx(self, mock_load_docx):
+        mock_load_docx.return_value = "docx text"
+        result = pdf_utils.load_document("sample.docx")
+        self.assertEqual(result, "docx text")
+        mock_load_docx.assert_called_once_with("sample.docx")
+
+    def test_load_document_reads_plain_text_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = os.path.join(tmpdir, "sample.log")
+            with open(file_path, "w", encoding="utf-8") as handle:
+                handle.write("hello from text file")
+
+            result = pdf_utils.load_document(file_path)
+            self.assertEqual(result, "hello from text file")
 
     @patch("src.rlm_handler.get_client")
     @patch("src.rlm_handler.rlm.RLM")

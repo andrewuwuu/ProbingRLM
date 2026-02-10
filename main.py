@@ -5,11 +5,11 @@ import queue
 from dotenv import load_dotenv
 
 from src.output_utils import save_markdown_response, save_pdf_response
-from src.pdf_utils import list_pdfs, load_pdf
+from src.pdf_utils import list_documents, load_document
 from src.prompt_loader import load_prompts
 from src.rlm_handler import RLMHandler
 
-PDF_DIR = "embed-docs"
+DOCUMENT_DIR = "embed-docs"
 PROMPTS_FILE = "prompts.md"
 RESPONSE_DIR = "response"
 SUPPORTED_BACKENDS = {"openai", "openrouter"}
@@ -22,7 +22,7 @@ def _prompt_yes_no(message: str, default: bool = False) -> bool:
     return raw in {"y", "yes"}
 
 
-def _select_pdfs(items: list[str], prompt: str) -> list[str]:
+def _select_documents(items: list[str], prompt: str) -> list[str]:
     selected_index = -1
     while selected_index < 0 or selected_index >= len(items):
         selection = input(prompt).strip().lower()
@@ -305,29 +305,29 @@ def main() -> None:
         print("You can copy .env.example to .env and fill in your keys.")
         return
 
-    print(f"=== RLM PDF Retrieval (Backend: {backend}) ===")
+    print(f"=== RLM Document Retrieval (Backend: {backend}) ===")
 
-    created_pdf_dir = False
-    if not os.path.isdir(PDF_DIR):
-        os.makedirs(PDF_DIR, exist_ok=True)
-        created_pdf_dir = True
+    created_document_dir = False
+    if not os.path.isdir(DOCUMENT_DIR):
+        os.makedirs(DOCUMENT_DIR, exist_ok=True)
+        created_document_dir = True
 
-    pdfs = list_pdfs(PDF_DIR)
-    if not pdfs:
-        if created_pdf_dir:
-            print(f"Created '{PDF_DIR}/'.")
-        print(f"No PDF files found in '{PDF_DIR}/'.")
-        print("Place a PDF file there and try again.")
+    docs = list_documents(DOCUMENT_DIR)
+    if not docs:
+        if created_document_dir:
+            print(f"Created '{DOCUMENT_DIR}/'.")
+        print(f"No supported documents found in '{DOCUMENT_DIR}/'.")
+        print("Place files like .pdf, .docx, .txt, .md (or other text files) there and try again.")
         return
 
-    print(f"\nAvailable PDFs in '{PDF_DIR}/':")
-    for i, pdf in enumerate(pdfs, start=1):
-        print(f"{i}. {pdf}")
+    print(f"\nAvailable documents in '{DOCUMENT_DIR}/':")
+    for i, doc in enumerate(docs, start=1):
+        print(f"{i}. {doc}")
 
-    print("a. All PDFs")
+    print("a. All documents")
     try:
-        selected_pdfs = _select_pdfs(
-            pdfs, "\nSelect a PDF number, 'a' for all, or 'q' to quit: "
+        selected_docs = _select_documents(
+            docs, "\nSelect a document number, 'a' for all, or 'q' to quit: "
         )
     except KeyboardInterrupt:
         return
@@ -355,30 +355,30 @@ def main() -> None:
             )
 
     combined_sections: list[str] = []
-    failed_pdfs: list[str] = []
-    for selected_pdf in selected_pdfs:
-        pdf_path = os.path.join(PDF_DIR, selected_pdf)
-        print(f"\nLoading {selected_pdf}...")
-        pdf_text = load_pdf(pdf_path)
-        if not pdf_text:
-            failed_pdfs.append(selected_pdf)
+    failed_docs: list[str] = []
+    for selected_doc in selected_docs:
+        doc_path = os.path.join(DOCUMENT_DIR, selected_doc)
+        print(f"\nLoading {selected_doc}...")
+        doc_text = load_document(doc_path)
+        if not doc_text:
+            failed_docs.append(selected_doc)
             continue
         combined_sections.append(
-            f"===== BEGIN FILE: {selected_pdf} =====\n{pdf_text}\n===== END FILE: {selected_pdf} ====="
+            f"===== BEGIN FILE: {selected_doc} =====\n{doc_text}\n===== END FILE: {selected_doc} ====="
         )
 
     if not combined_sections:
-        print("Failed to extract text from selected PDFs.")
-        if failed_pdfs:
-            print(f"Failed files: {', '.join(failed_pdfs)}")
+        print("Failed to extract text from selected documents.")
+        if failed_docs:
+            print(f"Failed files: {', '.join(failed_docs)}")
         return
 
-    if failed_pdfs:
-        print(f"Warning: failed to read {len(failed_pdfs)} file(s): {', '.join(failed_pdfs)}")
+    if failed_docs:
+        print(f"Warning: failed to read {len(failed_docs)} file(s): {', '.join(failed_docs)}")
 
-    pdf_text = "\n\n".join(combined_sections)
+    document_text = "\n\n".join(combined_sections)
     print(
-        f"Loaded {len(combined_sections)} PDF(s) into context. Total extracted characters: {len(pdf_text)}."
+        f"Loaded {len(combined_sections)} document(s) into context. Total extracted characters: {len(document_text)}."
     )
 
     prompts_cache: dict[str, str] = {}
@@ -419,7 +419,7 @@ def main() -> None:
 
         query_kwargs = dict(
             prompt=query,
-            context=pdf_text,
+            context=document_text,
             model=model_name,
             use_subagents=use_subagents,
             system_prompt=system_prompt,
