@@ -5,6 +5,17 @@ from typing import Optional
 from rlm.clients import get_client
 from rlm.utils.prompts import RLM_SYSTEM_PROMPT
 
+API_KEY_ENV_BY_BACKEND = {
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "portkey": "PORTKEY_API_KEY",
+    "vercel": "AI_GATEWAY_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "azure_openai": "AZURE_OPENAI_API_KEY",
+}
+STRICT_API_KEY_BACKENDS = {"anthropic", "portkey"}
+
 
 class _InMemoryRLMLogger:
     """Collect RLM iterations in memory so we can compute runtime metrics."""
@@ -23,6 +34,29 @@ class _InMemoryRLMLogger:
         return len(self.iterations)
 
 
+class _GuardedRLMLogger(_InMemoryRLMLogger):
+    """Logger that aborts the run when subagent-call budget is exceeded."""
+
+    def __init__(self, max_subagent_calls: int) -> None:
+        super().__init__()
+        self.max_subagent_calls = max_subagent_calls
+        self.subagent_calls = 0
+
+    def log(self, iteration) -> None:
+        super().log(iteration)
+        current_calls = 0
+        for code_block in getattr(iteration, "code_blocks", []):
+            result = getattr(code_block, "result", None)
+            if not result:
+                continue
+            current_calls += len(getattr(result, "rlm_calls", []) or [])
+        self.subagent_calls += current_calls
+        if self.subagent_calls > self.max_subagent_calls:
+            raise RuntimeError(
+                f"Max subagent calls exceeded: {self.subagent_calls} > {self.max_subagent_calls}"
+            )
+
+
 class RLMHandler:
     def __init__(
         self,
@@ -35,15 +69,74 @@ class RLMHandler:
         self.verbose = verbose
         self.last_metrics: dict = {}
 
-        # Ensure API key is set in environment for the backend to pick it up
-        if api_key and backend == "openai":
-            os.environ["OPENAI_API_KEY"] = api_key
-        elif api_key and backend == "openrouter":
-            os.environ["OPENROUTER_API_KEY"] = api_key
+        # Ensure API key is set in environment for the backend to pick it up.
+        key_env_var = API_KEY_ENV_BY_BACKEND.get(backend)
+        if api_key and key_env_var:
+            os.environ[key_env_var] = api_key
 
     @staticmethod
     def _compose_single_pass_prompt(question: str, context: str) -> str:
         return f"Context:\n{context}\n\nQuestion: {question}"
+
+    def _inject_backend_config(
+        self,
+        backend: str,
+        backend_kwargs: dict[str, str],
+        explicit_api_key: Optional[str] = None,
+    ) -> dict[str, str]:
+        kwargs = dict(backend_kwargs)
+
+        api_key = explicit_api_key or kwargs.get("api_key")
+        if not api_key:
+            key_env_var = API_KEY_ENV_BY_BACKEND.get(backend)
+            if key_env_var:
+                api_key = (os.getenv(key_env_var) or "").strip() or None
+
+        if api_key and backend in STRICT_API_KEY_BACKENDS.union(
+            {"gemini", "azure_openai", "litellm"}
+        ):
+            kwargs.setdefault("api_key", api_key)
+
+        if backend == "vllm":
+            base_url = (kwargs.get("base_url") or os.getenv("RLM_VLLM_BASE_URL") or "").strip()
+            if not base_url:
+                raise ValueError(
+                    "Backend 'vllm' requires base_url. Set RLM_VLLM_BASE_URL in .env."
+                )
+            kwargs["base_url"] = base_url
+
+        if backend == "litellm":
+            api_base = (kwargs.get("api_base") or os.getenv("RLM_LITELLM_API_BASE") or "").strip()
+            if api_base:
+                kwargs["api_base"] = api_base
+            lite_api_key = (os.getenv("RLM_LITELLM_API_KEY") or "").strip()
+            if lite_api_key:
+                kwargs.setdefault("api_key", lite_api_key)
+
+        if backend == "azure_openai":
+            azure_endpoint = (
+                kwargs.get("azure_endpoint") or os.getenv("AZURE_OPENAI_ENDPOINT") or ""
+            ).strip()
+            if azure_endpoint:
+                kwargs["azure_endpoint"] = azure_endpoint
+
+            api_version = (
+                kwargs.get("api_version") or os.getenv("AZURE_OPENAI_API_VERSION") or ""
+            ).strip()
+            if api_version:
+                kwargs["api_version"] = api_version
+
+            azure_deployment = (
+                kwargs.get("azure_deployment") or os.getenv("AZURE_OPENAI_DEPLOYMENT") or ""
+            ).strip()
+            if azure_deployment:
+                kwargs["azure_deployment"] = azure_deployment
+
+        if backend in STRICT_API_KEY_BACKENDS and not kwargs.get("api_key"):
+            key_env_var = API_KEY_ENV_BY_BACKEND.get(backend, "API key env var")
+            raise ValueError(f"Backend '{backend}' requires API key ({key_env_var}).")
+
+        return kwargs
 
     def query(
         self,
@@ -54,6 +147,8 @@ class RLMHandler:
         system_prompt: Optional[str] = None,
         subagent_backend: Optional[str] = None,
         subagent_model: Optional[str] = None,
+        max_iterations: Optional[int] = None,
+        max_subagent_calls: Optional[int] = None,
     ) -> str:
         """
         Query the model with prompt + context.
@@ -67,6 +162,8 @@ class RLMHandler:
             system_prompt: Optional system prompt to guide the RLM.
             subagent_backend: Optional backend for recursive sub-calls.
             subagent_model: Optional model name for recursive sub-calls.
+            max_iterations: Optional cap for RLM iterations (root loop).
+            max_subagent_calls: Optional hard budget for cumulative llm_query calls.
 
         Returns:
             The model's response.
@@ -74,7 +171,13 @@ class RLMHandler:
         backend_kwargs = {}
         if model:
             backend_kwargs["model_name"] = model
+        backend_kwargs = self._inject_backend_config(
+            backend=self.backend,
+            backend_kwargs=backend_kwargs,
+            explicit_api_key=self.api_key,
+        )
 
+        tracker: _InMemoryRLMLogger | None = None
         try:
             if not use_subagents:
                 client = get_client(self.backend, backend_kwargs)
@@ -96,7 +199,16 @@ class RLMHandler:
                 )
                 return completion_text
 
-            tracker = _InMemoryRLMLogger()
+            if max_iterations is not None and max_iterations <= 0:
+                raise ValueError("max_iterations must be greater than 0 when provided.")
+            if max_subagent_calls is not None and max_subagent_calls <= 0:
+                raise ValueError("max_subagent_calls must be greater than 0 when provided.")
+
+            tracker = (
+                _GuardedRLMLogger(max_subagent_calls=max_subagent_calls)
+                if max_subagent_calls is not None
+                else _InMemoryRLMLogger()
+            )
             rlm_system_prompt = self._compose_rlm_system_prompt(
                 user_system_prompt=system_prompt,
                 subagent_model=subagent_model,
@@ -107,6 +219,7 @@ class RLMHandler:
                     system_prompt=rlm_system_prompt,
                     subagent_backend=subagent_backend,
                     subagent_model=subagent_model,
+                    max_iterations=max_iterations,
                     logger=tracker,
                 )
             )
@@ -155,7 +268,18 @@ class RLMHandler:
             return response_text
 
         except Exception as e:
-            self.last_metrics = {"error": str(e)}
+            error_text = str(e)
+            self.last_metrics = {"error": error_text}
+            if tracker and "Max subagent calls exceeded" in error_text:
+                self.last_metrics.update(
+                    {
+                        "mode": "rlm_subagents",
+                        "iterations": tracker.iteration_count,
+                        "subagent_calls": getattr(tracker, "subagent_calls", 0),
+                        "max_subagent_calls_exceeded": True,
+                        "max_subagent_calls": max_subagent_calls,
+                    }
+                )
             return f"Error querying RLM: {e}"
 
     @staticmethod
@@ -190,6 +314,7 @@ class RLMHandler:
         system_prompt: Optional[str],
         subagent_backend: Optional[str],
         subagent_model: Optional[str],
+        max_iterations: Optional[int],
         logger,
     ) -> dict:
         rlm_kwargs = {
@@ -200,6 +325,8 @@ class RLMHandler:
             "verbose": self.verbose,
             "logger": logger,
         }
+        if max_iterations is not None:
+            rlm_kwargs["max_iterations"] = max_iterations
 
         if bool(subagent_backend) != bool(subagent_model):
             raise ValueError(
@@ -208,7 +335,12 @@ class RLMHandler:
 
         if subagent_backend and subagent_model:
             rlm_kwargs["other_backends"] = [subagent_backend]
-            rlm_kwargs["other_backend_kwargs"] = [{"model_name": subagent_model}]
+            rlm_kwargs["other_backend_kwargs"] = [
+                self._inject_backend_config(
+                    backend=subagent_backend,
+                    backend_kwargs={"model_name": subagent_model},
+                )
+            ]
 
         return rlm_kwargs
 

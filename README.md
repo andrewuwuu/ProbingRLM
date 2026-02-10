@@ -24,7 +24,7 @@ The project is designed to stay practical:
 The CLI entrypoint is `main.py`.
 
 1. Environment variables are loaded from `.env`.
-2. Backend and API key are resolved (`openrouter` or `openai`).
+2. Backend and credentials are resolved from supported providers.
 3. You pick document(s) and model.
 4. You choose execution mode:
    - direct LM mode (`use_subagents = false`)
@@ -33,7 +33,8 @@ The CLI entrypoint is `main.py`.
 5. The response is printed and can be saved to disk.
 
 Implementation files:
-- `main.py`: interactive flow and orchestration
+- `main.py`: thin CLI entrypoint/wrapper
+- `src/cli_app.py`: interactive flow and orchestration
 - `src/rlm_handler.py`: backend/model calls and RLM behavior
 - `src/pdf_utils.py`: document discovery + text extraction
 - `src/prompt_loader.py`: markdown prompt section parsing
@@ -44,9 +45,7 @@ Implementation files:
 
 - Python `>=3.11`
 - `uv` for dependency management
-- At least one API key:
-  - `OPENROUTER_API_KEY`, or
-  - `OPENAI_API_KEY`
+- Backend-specific credentials for the provider you use.
 
 ## Installation
 
@@ -62,16 +61,33 @@ OPENROUTER_API_KEY=your_key_here
 # or
 OPENAI_API_KEY=your_key_here
 
-# Optional explicit backend selection: openrouter|openai
+# Optional explicit backend selection:
+# openai|openrouter|anthropic|gemini|portkey|vercel|azure_openai|litellm|vllm
 RLM_BACKEND=openrouter
 
 # Optional defaults for cross-provider/model subagents.
 # Must be set together if used.
 RLM_SUBAGENT_BACKEND=openai
 RLM_SUBAGENT_MODEL=gpt-4.1-mini
+
+# Optional runtime safety guards (positive integers):
+RLM_MAX_ITERATIONS=20
+RLM_MAX_SUBAGENT_CALLS=40
 ```
 
-If `RLM_BACKEND` is omitted, the app prefers OpenRouter when both keys exist.
+Supported backends:
+- `openai`
+- `openrouter`
+- `anthropic`
+- `gemini`
+- `portkey`
+- `vercel`
+- `azure_openai`
+- `litellm`
+- `vllm`
+
+If `RLM_BACKEND` is omitted, the app auto-detects the first configured backend in this order:
+`openrouter -> openai -> anthropic -> gemini -> portkey -> vercel -> azure_openai`.
 
 ## Quick Start
 
@@ -151,7 +167,11 @@ Example:
 
 Requirements:
 - both `RLM_SUBAGENT_BACKEND` and `RLM_SUBAGENT_MODEL` can be pre-set in `.env`, or entered interactively
-- the selected subagent backend must have a valid API key in `.env`
+- the selected subagent backend must be fully configured in `.env` (API key and backend-specific extras when needed)
+- same-provider subagents are supported (for example `openrouter -> openrouter` with a different model)
+- optional guardrails:
+  - `RLM_MAX_ITERATIONS`: caps root RLM loop iterations
+  - `RLM_MAX_SUBAGENT_CALLS`: aborts runs that exceed subagent-call budget
 
 ## Output Saving
 
@@ -168,9 +188,7 @@ All saved files are written under the project `response/` directory.
 Run all current tests:
 
 ```bash
-uv run python tests/verify_retrieval.py
-uv run python tests/test_prompt_loader.py
-uv run python tests/test_pdf_gen.py
+uv run python -m pytest -q
 ```
 
 Test coverage includes:
@@ -183,13 +201,15 @@ Test coverage includes:
 ## Troubleshooting
 
 - `No API key found`:
-  - Set `OPENROUTER_API_KEY` or `OPENAI_API_KEY` in `.env`.
+  - Set `RLM_BACKEND` and required backend credentials in `.env`.
 - `RLM_BACKEND=... but ..._API_KEY is missing`:
   - Either add the matching key or change `RLM_BACKEND`.
 - `No supported documents found in 'embed-docs/'`:
   - Add files such as `.pdf`, `.docx`, `.txt`, or `.md` into `embed-docs/`.
 - Empty or weak answers:
   - Try a stronger model, add a `System` prompt, or enable subagents.
+- Very long-running subagent sessions:
+  - Set `RLM_MAX_ITERATIONS` and/or `RLM_MAX_SUBAGENT_CALLS` in `.env`.
 
 ## Notes
 

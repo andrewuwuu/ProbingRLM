@@ -157,6 +157,8 @@ class TestPDFRetrieval(unittest.TestCase):
             system_prompt="SysPrompt",
             subagent_backend="openai",
             subagent_model="gpt-4.1-mini",
+            max_iterations=12,
+            max_subagent_calls=8,
         )
 
         self.assertEqual(response, "Mocked Recursive Response")
@@ -165,6 +167,7 @@ class TestPDFRetrieval(unittest.TestCase):
         rlm_init = mock_rlm_class.call_args.kwargs
         self.assertEqual(rlm_init.get("backend_kwargs", {}).get("model_name"), "openai/gpt-5-mini")
         self.assertEqual(rlm_init.get("max_depth"), 1)
+        self.assertEqual(rlm_init.get("max_iterations"), 12)
         self.assertIn("SysPrompt", rlm_init.get("custom_system_prompt", ""))
         self.assertIn("Before FINAL, make at least one llm_query", rlm_init.get("custom_system_prompt", ""))
         self.assertEqual(rlm_init.get("other_backends"), ["openai"])
@@ -181,6 +184,41 @@ class TestPDFRetrieval(unittest.TestCase):
         self.assertEqual(handler.last_metrics["total_input_tokens"], 320)
         self.assertEqual(handler.last_metrics["total_output_tokens"], 120)
         self.assertEqual(handler.last_metrics["total_tokens"], 440)
+
+    def test_guarded_logger_raises_on_subagent_budget_exceeded(self):
+        logger = rlm_handler._GuardedRLMLogger(max_subagent_calls=1)
+        iter_one = SimpleNamespace(
+            code_blocks=[SimpleNamespace(result=SimpleNamespace(rlm_calls=["call-1"]))]
+        )
+        iter_two = SimpleNamespace(
+            code_blocks=[SimpleNamespace(result=SimpleNamespace(rlm_calls=["call-2"]))]
+        )
+
+        logger.log(iter_one)
+        self.assertEqual(logger.subagent_calls, 1)
+        with self.assertRaises(RuntimeError):
+            logger.log(iter_two)
+
+    @patch("src.rlm_handler.rlm.RLM")
+    def test_rlm_query_reports_subagent_call_guard_violation(self, mock_rlm_class):
+        mock_agent = MagicMock()
+        mock_agent.completion.side_effect = RuntimeError(
+            "Max subagent calls exceeded: 2 > 1"
+        )
+        mock_rlm_class.return_value = mock_agent
+
+        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+        response = handler.query(
+            "Prompt",
+            "Context",
+            model="openai/gpt-5-mini",
+            use_subagents=True,
+            max_subagent_calls=1,
+        )
+
+        self.assertIn("Max subagent calls exceeded", response)
+        self.assertTrue(handler.last_metrics.get("max_subagent_calls_exceeded"))
+        self.assertEqual(handler.last_metrics.get("max_subagent_calls"), 1)
 
     def test_rlm_query_rejects_partial_subagent_config(self):
         handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
