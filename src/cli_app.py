@@ -1,38 +1,55 @@
-import os
-import time
 import multiprocessing as mp
+import os
 import queue
-from typing import Callable
+import time
+from typing import Any, Callable
+
 from dotenv import load_dotenv
 
+from src.cli_config import (
+    _load_tools_from_env,
+    _parse_bool_env,
+    _parse_json_object_env,
+    _parse_positive_float_env,
+    _parse_positive_int_env,
+    _read_env,
+    _resolve_backend_and_key,
+    _resolve_root_model_default,
+    _resolve_subagent_config as _resolve_subagent_config_impl,
+)
+from src.cli_metrics import (
+    _merge_run_metrics_with_fallback,
+    _merge_run_metrics_with_retry,
+    _parse_context_limit_error,
+    _print_query_metrics as _print_query_metrics_impl,
+    _response_has_pdf_page_na_citation,
+    _should_use_research_direct_fallback,
+    _with_openrouter_middle_out,
+)
+from src.cli_prompting import (
+    _build_runtime_prompt_vars,
+    _get_prompt_section,
+    _normalize_output_mode,
+    _output_template_for_mode,
+    _prompt_output_mode,
+    _render_prompt_section,
+    _resolve_default_output_mode as _resolve_default_output_mode_impl,
+    _select_documents,
+    default_prompt_query as _default_prompt_query_impl,
+    default_should_continue_session,
+)
 from src.output_utils import save_markdown_response, save_pdf_response
 from src.pdf_utils import list_documents, load_document
-from src.prompt_loader import load_prompts
+from src.prompt_loader import load_prompts, parse_prompt_variables
 from src.rlm_handler import RLMHandler
 
 DOCUMENT_DIR = "embed-docs"
 PROMPTS_FILE = "prompts.md"
 RESPONSE_DIR = "response"
-SUPPORTED_BACKENDS = (
-    "openai",
-    "openrouter",
-    "anthropic",
-    "portkey",
-    "litellm",
-    "vllm",
-    "vercel",
-    "gemini",
-    "azure_openai",
+FORCE_SUBAGENT_QUERY_INSTRUCTION = (
+    "Subagent requirement: you must call llm_query(...) or llm_query_batched(...) at least "
+    "once before SUBMIT(...). If no subagent call is made, the answer is invalid."
 )
-REQUIRED_API_KEY_ENV_BY_BACKEND = {
-    "openai": "OPENAI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "portkey": "PORTKEY_API_KEY",
-    "vercel": "AI_GATEWAY_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "azure_openai": "AZURE_OPENAI_API_KEY",
-}
 
 
 def default_prompt_yes_no(message: str, default: bool = False) -> bool:
@@ -42,100 +59,18 @@ def default_prompt_yes_no(message: str, default: bool = False) -> bool:
     return raw in {"y", "yes"}
 
 
-def _parse_positive_int_env(var_name: str) -> int | None:
-    raw = (os.getenv(var_name) or "").strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        print(f"Ignoring {var_name}: expected integer but got '{raw}'.")
-        return None
-    if value <= 0:
-        print(f"Ignoring {var_name}: expected > 0 but got '{value}'.")
-        return None
-    return value
-
-
-def _select_documents(items: list[str], prompt: str) -> list[str]:
-    selected_index = -1
-    while selected_index < 0 or selected_index >= len(items):
-        selection = input(prompt).strip().lower()
-        if selection == "q":
-            raise KeyboardInterrupt
-        if selection in {"a", "all"}:
-            return items
-        try:
-            selected_index = int(selection) - 1
-        except ValueError:
-            print("Please enter a valid number, 'a' for all, or 'q' to quit.")
-
-    return [items[selected_index]]
-
-
-def _backend_configuration_error(backend: str) -> str | None:
-    api_key_env = REQUIRED_API_KEY_ENV_BY_BACKEND.get(backend)
-    if api_key_env and not os.getenv(api_key_env):
-        return f"{api_key_env} is missing."
-
-    if backend == "vllm" and not (os.getenv("RLM_VLLM_BASE_URL") or "").strip():
-        return "RLM_VLLM_BASE_URL is missing."
-
-    if backend == "azure_openai" and not (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip():
-        return "AZURE_OPENAI_ENDPOINT is missing."
-
-    return None
-
-
-def _resolve_backend_and_key() -> tuple[str, str | None]:
-    configured_backend = (os.getenv("RLM_BACKEND") or "").strip().lower()
-
-    if configured_backend and configured_backend not in SUPPORTED_BACKENDS:
-        raise ValueError(
-            "RLM_BACKEND must be one of: " + ", ".join(SUPPORTED_BACKENDS) + "."
-        )
-
-    if configured_backend:
-        config_error = _backend_configuration_error(configured_backend)
-        if config_error:
-            raise ValueError(f"RLM_BACKEND={configured_backend} but {config_error}")
-        api_key_env = REQUIRED_API_KEY_ENV_BY_BACKEND.get(configured_backend)
-        return configured_backend, (os.getenv(api_key_env) if api_key_env else None)
-
-    autodetect_order = [
-        "openrouter",
-        "openai",
-        "anthropic",
-        "gemini",
-        "portkey",
-        "vercel",
-        "azure_openai",
-    ]
-    for backend in autodetect_order:
-        if not _backend_configuration_error(backend):
-            api_key_env = REQUIRED_API_KEY_ENV_BY_BACKEND.get(backend)
-            return backend, (os.getenv(api_key_env) if api_key_env else None)
-
-    raise ValueError(
-        "No usable backend config found. Set RLM_BACKEND and required credentials in .env "
-        "(e.g., OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, "
-        "PORTKEY_API_KEY, AI_GATEWAY_API_KEY, or AZURE_OPENAI_* settings)."
+def _resolve_default_output_mode(prompt_vars: dict[str, str]) -> str:
+    return _resolve_default_output_mode_impl(
+        prompt_vars=prompt_vars,
+        env_output_mode=_read_env("DSPY_OUTPUT_MODE"),
     )
 
 
-def _default_model_for_backend(backend: str) -> str:
-    defaults = {
-        "openrouter": "openai/gpt-5-mini",
-        "openai": "gpt-4.1-mini",
-        "anthropic": "claude-3-5-haiku-latest",
-        "gemini": "gemini-2.5-flash",
-        "portkey": "openai/gpt-4.1-mini",
-        "litellm": "openai/gpt-4.1-mini",
-        "vllm": "meta-llama/Llama-3.1-8B-Instruct",
-        "vercel": "openai/gpt-4.1-mini",
-        "azure_openai": "gpt-4o-mini",
-    }
-    return defaults.get(backend, "gpt-4.1-mini")
+def default_prompt_query(
+    default_query: str | None,
+    prompt_yes_no: Callable[[str, bool], bool] = default_prompt_yes_no,
+) -> str:
+    return _default_prompt_query_impl(default_query, prompt_yes_no)
 
 
 def _resolve_subagent_config(
@@ -144,96 +79,45 @@ def _resolve_subagent_config(
     root_model: str,
     prompt_yes_no: Callable[[str, bool], bool] = default_prompt_yes_no,
 ) -> tuple[str | None, str | None]:
-    if not use_subagents:
-        return None, None
-
-    env_backend = (os.getenv("RLM_SUBAGENT_BACKEND") or "").strip().lower()
-    env_model = (os.getenv("RLM_SUBAGENT_MODEL") or "").strip()
-    default_use_different = bool(env_backend and env_model)
-
-    use_different = prompt_yes_no(
-        "Use a different backend/model for subagents? (y/N): ",
-        default=default_use_different,
+    return _resolve_subagent_config_impl(
+        use_subagents=use_subagents,
+        root_backend=root_backend,
+        root_model=root_model,
+        prompt_yes_no=prompt_yes_no,
     )
-    if not use_different:
-        return None, None
-
-    default_backend = env_backend or root_backend
-    if default_backend not in SUPPORTED_BACKENDS:
-        default_backend = root_backend
-
-    while True:
-        sub_backend = (
-            input(
-                f"Subagent backend ({'/'.join(SUPPORTED_BACKENDS)}) [default: {default_backend}]: "
-            ).strip().lower()
-            or default_backend
-        )
-        if sub_backend in SUPPORTED_BACKENDS:
-            break
-        print(f"Unsupported backend. Choose one of: {', '.join(SUPPORTED_BACKENDS)}.")
-
-    config_error = _backend_configuration_error(sub_backend)
-    if config_error:
-        print(f"Backend '{sub_backend}' is not configured: {config_error}")
-        print("Falling back to root backend/model for subagents.")
-        return None, None
-
-    default_model = env_model or _default_model_for_backend(sub_backend)
-    sub_model = input(f"Subagent model (default: {default_model}): ").strip() or default_model
-
-    if sub_backend == root_backend and sub_model == root_model:
-        print("Subagent backend/model matches root model. Using root settings.")
-        return None, None
-
-    return sub_backend, sub_model
 
 
-def _get_prompt_section(prompts: dict[str, str], section_name: str) -> str | None:
-    lower_name = section_name.lower()
-    for key, value in prompts.items():
-        if key.strip().lower() == lower_name:
-            return value
-    return None
+def _preferred_mp_start_method() -> str:
+    available = mp.get_all_start_methods()
+    if "fork" in available:
+        return "fork"
+    return "spawn"
 
 
-def default_prompt_query(
-    default_query: str | None,
-    prompt_yes_no: Callable[[str, bool], bool] = default_prompt_yes_no,
+def _query_worker(
+    backend: str,
+    api_key: str | None,
+    verbose: bool,
+    query_kwargs: dict,
+    out_queue,
+) -> None:
+    worker_handler = RLMHandler(backend=backend, api_key=api_key, verbose=verbose)
+    response = worker_handler.query(**query_kwargs)
+    payload = {
+        "response": response,
+        "metrics": worker_handler.last_metrics,
+    }
+    out_queue.put(payload)
+
+
+def _run_query_with_live_status(
+    handler: RLMHandler,
+    query_kwargs: dict,
+    timeout_seconds: float | None = None,
 ) -> str:
-    if not default_query:
-        return input("\nEnter your query (or 'q' to quit): ").strip()
-
-    preview = " ".join(default_query.split())
-    if len(preview) > 120:
-        preview = preview[:117] + "..."
-    print(f"\nDefault query loaded: {preview}")
-
-    if prompt_yes_no("Use loaded default query? (Y/n): ", default=True):
-        return default_query
-
-    query = input("\nEnter your query (or 'q' to quit): ").strip()
-    if query.lower() in {"y", "yes", "n", "no"}:
-        print(
-            "That looks like a yes/no answer. Enter your query text, or press Enter to use the loaded default."
-        )
-        retry = input("Query text [default: loaded from file]: ").strip()
-        if not retry:
-            return default_query
-        return retry
-
-    return query
-
-
-def default_should_continue_session(allow_follow_ups: bool, answered_queries: int) -> bool:
-    if allow_follow_ups:
-        return True
-    return answered_queries < 1
-
-
-def _run_query_with_live_status(handler: RLMHandler, query_kwargs: dict) -> str:
     result: dict[str, dict | str] = {}
-    ctx = mp.get_context("spawn")
+    timed_out = False
+    ctx = mp.get_context(_preferred_mp_start_method())
     out_queue: mp.Queue = ctx.Queue()
 
     process = ctx.Process(
@@ -254,7 +138,28 @@ def _run_query_with_live_status(handler: RLMHandler, query_kwargs: dict) -> str:
 
     process.start()
     try:
-        while process.is_alive():
+        while True:
+            elapsed = time.perf_counter() - start_time
+            if timeout_seconds is not None and elapsed >= timeout_seconds:
+                timed_out = True
+                break
+
+            try:
+                result = out_queue.get(timeout=0.2)
+                break
+            except queue.Empty:
+                pass
+
+            if not process.is_alive():
+                grace_deadline = time.perf_counter() + 1.5
+                while time.perf_counter() < grace_deadline:
+                    try:
+                        result = out_queue.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        pass
+                break
+
             elapsed = time.perf_counter() - start_time
             print(
                 f"\rProcessing {spinner[spinner_index % len(spinner)]}  elapsed: {elapsed:5.1f}s",
@@ -262,7 +167,6 @@ def _run_query_with_live_status(handler: RLMHandler, query_kwargs: dict) -> str:
                 flush=True,
             )
             spinner_index += 1
-            time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nCancelling query...")
         if process.is_alive():
@@ -273,20 +177,57 @@ def _run_query_with_live_status(handler: RLMHandler, query_kwargs: dict) -> str:
                 process.join(timeout=2)
         handler.last_metrics = {"cancelled": True}
         return "Query cancelled by user."
+    finally:
+        if process.is_alive():
+            if timed_out:
+                process.terminate()
+                process.join(timeout=2)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2)
+            else:
+                process.join(timeout=1)
 
-    process.join()
+    if timed_out:
+        handler.last_metrics = {
+            "error": "query_timeout",
+            "timeout_seconds": timeout_seconds,
+        }
+        try:
+            out_queue.close()
+        except Exception:
+            pass
+        return f"Error querying DSPy: timed out after {timeout_seconds:.1f}s"
+
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+
+    if process.exitcode is None:
+        process.join(timeout=1)
+
+    try:
+        if not result:
+            try:
+                result = out_queue.get_nowait()
+            except queue.Empty:
+                pass
+    finally:
+        try:
+            out_queue.close()
+        except Exception:
+            pass
+
     elapsed = time.perf_counter() - start_time
     print(f"\rProcessing complete. elapsed: {elapsed:5.1f}s{' ' * 12}")
 
     if process.exitcode != 0:
         handler.last_metrics = {"error": f"worker_exit_code_{process.exitcode}"}
-        return f"Error querying RLM: worker exited with code {process.exitcode}"
+        return f"Error querying DSPy: worker exited with code {process.exitcode}"
 
-    try:
-        result = out_queue.get_nowait()
-    except queue.Empty:
+    if not result:
         handler.last_metrics = {"error": "missing_worker_output"}
-        return "Error querying RLM: worker produced no output"
+        return "Error querying DSPy: worker produced no output"
 
     response = str(result.get("response", ""))
     metrics = result.get("metrics", {})
@@ -297,71 +238,9 @@ def _run_query_with_live_status(handler: RLMHandler, query_kwargs: dict) -> str:
     return response
 
 
-def _query_worker(
-    backend: str,
-    api_key: str | None,
-    verbose: bool,
-    query_kwargs: dict,
-    out_queue,
-) -> None:
-    worker_handler = RLMHandler(backend=backend, api_key=api_key, verbose=verbose)
-    response = worker_handler.query(**query_kwargs)
-    out_queue.put(
-        {
-            "response": response,
-            "metrics": worker_handler.last_metrics,
-        }
-    )
-
-
 def _print_query_metrics(metrics: dict) -> None:
-    if not metrics:
-        print("\nRun Metrics: unavailable")
-        return
-
-    print("\nRun Metrics:")
-    print(f"- Mode: {metrics.get('mode', 'unknown')}")
-    if metrics.get("cancelled"):
-        print("- Status: cancelled by user")
-        return
-    if metrics.get("error"):
-        print(f"- Error: {metrics.get('error')}")
-        return
-
-    execution_time = metrics.get("execution_time")
-    if execution_time is not None:
-        print(f"- Execution Time: {execution_time:.2f}s")
-
-    print(f"- Iterations: {metrics.get('iterations', 0)}")
-    print(f"- Subagent Calls: {metrics.get('subagent_calls', 0)}")
-    print(f"- Input Tokens: {metrics.get('total_input_tokens', 0)}")
-    print(f"- Output Tokens: {metrics.get('total_output_tokens', 0)}")
-    print(f"- Total Tokens: {metrics.get('total_tokens', 0)}")
-    if metrics.get("mode") == "rlm_subagents":
-        configured_subagent_model = metrics.get("configured_subagent_model")
-        subagent_calls = int(metrics.get("subagent_calls", 0))
-        if configured_subagent_model and subagent_calls == 0:
-            print(
-                "- Warning: no subagent calls were made, so only the root model executed."
-            )
-        if metrics.get("max_subagent_calls_exceeded"):
-            print(
-                "- Guard: max subagent calls exceeded; run aborted by configured safety limit."
-            )
-        if metrics.get("retry_attempted"):
-            print("- Recovery: retried once after FINAL_VAR variable error")
-        if metrics.get("fallback_used"):
-            print("- Recovery: used direct completion fallback after retry failure")
-
-    model_usage = metrics.get("model_usage", {})
-    if model_usage:
-        print("- Per-Model Usage:")
-        for model_name, usage in model_usage.items():
-            print(
-                f"  {model_name}: calls={usage.get('total_calls', 0)}, "
-                f"in={usage.get('total_input_tokens', 0)}, "
-                f"out={usage.get('total_output_tokens', 0)}"
-            )
+    verbose_metrics = bool(_parse_bool_env("DSPY_VERBOSE_METRICS"))
+    _print_query_metrics_impl(metrics=metrics, verbose_metrics=verbose_metrics)
 
 
 def main(
@@ -380,7 +259,7 @@ def main(
         print("You can copy .env.example to .env and fill in your keys.")
         return
 
-    print(f"=== RLM Document Retrieval (Backend: {backend}) ===")
+    print(f"=== DSPy Document Retrieval (Backend: {backend}) ===")
 
     created_document_dir = False
     if not os.path.isdir(DOCUMENT_DIR):
@@ -398,43 +277,70 @@ def main(
     print(f"\nAvailable documents in '{DOCUMENT_DIR}/':")
     for i, doc in enumerate(docs, start=1):
         print(f"{i}. {doc}")
-
     print("a. All documents")
+
     try:
         selected_docs = _select_documents(
-            docs, "\nSelect a document number, 'a' for all, or 'q' to quit: "
+            docs,
+            "\nSelect a document number, 'a' for all, or 'q' to quit: ",
         )
     except KeyboardInterrupt:
         return
 
-    default_model = _default_model_for_backend(backend)
+    default_model = _resolve_root_model_default(backend)
     model_name = input(f"Enter model name (default: {default_model}): ").strip() or default_model
-    max_iterations = _parse_positive_int_env("RLM_MAX_ITERATIONS")
-    max_subagent_calls = _parse_positive_int_env("RLM_MAX_SUBAGENT_CALLS")
-    if max_iterations is not None:
-        print(f"RLM max iterations cap active: {max_iterations}")
-    if max_subagent_calls is not None:
-        print(f"RLM max subagent calls cap active: {max_subagent_calls}")
+    model_name = RLMHandler.canonical_model_for_backend(backend, model_name)
 
-    use_subagents = prompt_yes_no("Use RLM subagents? (y/N): ", default=False)
+    max_iterations = _parse_positive_int_env("DSPY_RLM_MAX_ITERATIONS")
+    max_llm_calls = _parse_positive_int_env("DSPY_RLM_MAX_LLM_CALLS")
+    max_output_chars = _parse_positive_int_env("DSPY_RLM_MAX_OUTPUT_CHARS")
+    max_depth = _parse_positive_int_env("DSPY_RLM_MAX_DEPTH")
+    subagent_prefetch_calls = _parse_positive_int_env("DSPY_SUBAGENT_PREFETCH_CALLS") or 0
+    rlm_signature = _read_env("DSPY_RLM_SIGNATURE") or None
+    custom_prompt = (os.getenv("DSPY_CUSTOM_PROMPT") or "").strip() or None
+    query_timeout_seconds = _parse_positive_float_env("DSPY_QUERY_TIMEOUT_SECONDS")
+
+    require_subagent_call = bool(_parse_bool_env("DSPY_REQUIRE_SUBAGENT_CALL"))
+    require_subagent_call_retry_once = bool(
+        _parse_bool_env("DSPY_REQUIRE_SUBAGENT_CALL_RETRY_ONCE")
+    )
+    enforce_pdf_page_citations = _parse_bool_env("DSPY_ENFORCE_PDF_PAGE_CITATIONS")
+
+    allow_research_direct_fallback = _parse_bool_env("DSPY_RESEARCH_ALLOW_DIRECT_FALLBACK")
+    if allow_research_direct_fallback is None:
+        allow_research_direct_fallback = True
+
+    citation_repair_direct_mode = _parse_bool_env("DSPY_CITATION_REPAIR_DIRECT_MODE")
+    if citation_repair_direct_mode is None:
+        citation_repair_direct_mode = False
+
+    openrouter_auto_middle_out = _parse_bool_env("DSPY_OPENROUTER_AUTO_MIDDLE_OUT")
+    if openrouter_auto_middle_out is None:
+        openrouter_auto_middle_out = True
+
+    root_lm_kwargs = _parse_json_object_env("DSPY_LM_KWARGS")
+    subagent_lm_kwargs = _parse_json_object_env("DSPY_SUBAGENT_LM_KWARGS")
+    rlm_interpreter = _parse_bool_env("DSPY_RLM_INTERPRETER")
+    rlm_tools = _load_tools_from_env("DSPY_RLM_TOOLS")
+
+    use_subagents = prompt_yes_no("Use DSPy RLM subagents? (y/N): ", default=False)
     subagent_backend: str | None = None
     subagent_model: str | None = None
     if use_subagents:
-        print("Subagent mode enabled (rlms currently supports max_depth=1).")
         subagent_backend, subagent_model = _resolve_subagent_config(
             use_subagents=use_subagents,
             root_backend=backend,
             root_model=model_name,
             prompt_yes_no=prompt_yes_no,
         )
-        if subagent_backend and subagent_model:
-            print(
-                f"Subagents configured to use backend='{subagent_backend}', model='{subagent_model}'."
-            )
-        else:
-            print(
-                "Subagents will use recursive depth-1 llm_query calls on the same root backend/model."
-            )
+    if require_subagent_call and not (subagent_backend and subagent_model):
+        print(
+            "Warning: strict subagent-call checks require a dedicated subagent backend/model. "
+            "Disabling strict subagent-call requirement for this run."
+        )
+        require_subagent_call = False
+
+    selected_pdf_docs = {doc.lower() for doc in selected_docs if doc.lower().endswith(".pdf")}
 
     combined_sections: list[str] = []
     failed_docs: list[str] = []
@@ -464,21 +370,35 @@ def main(
     )
 
     prompts_cache: dict[str, str] = {}
+    prompt_vars: dict[str, str] = {}
+    file_custom_prompt_template: str | None = None
+    file_rlm_signature_template: str | None = None
     if os.path.exists(PROMPTS_FILE) and prompt_yes_no(
         f"\nLoad prompts from {PROMPTS_FILE}? (y/N): ", default=False
     ):
         prompts_cache = load_prompts(PROMPTS_FILE)
-        system_prompt = _get_prompt_section(prompts_cache, "System")
-        default_query = _get_prompt_section(prompts_cache, "Query")
-        if system_prompt:
-            print(f"Loaded System Prompt: {system_prompt[:50]}...")
-        if default_query:
-            print(f"Loaded Default Query: {default_query[:50]}...")
+        variables_section = _get_prompt_section(prompts_cache, "Variables")
+        file_custom_prompt_template = (
+            _get_prompt_section(prompts_cache, "Custom Prompt")
+            or _get_prompt_section(prompts_cache, "Guidance")
+        )
+        file_rlm_signature_template = (
+            _get_prompt_section(prompts_cache, "RLM Signature")
+            or _get_prompt_section(prompts_cache, "Signature")
+        )
+        prompt_vars.update(parse_prompt_variables(variables_section))
+        print(f"Loaded prompts from {PROMPTS_FILE}.")
 
     allow_follow_ups = prompt_yes_no(
         "\nAllow follow-up queries in this run? (Y/n): ",
         default=True,
     )
+    selected_output_mode = _prompt_output_mode(_resolve_default_output_mode(prompt_vars))
+    output_template = prompt_vars.get("output_template") or _output_template_for_mode(
+        selected_output_mode
+    )
+    prompt_vars["output_mode"] = selected_output_mode
+    prompt_vars["output_template"] = output_template
 
     handler = RLMHandler(backend=backend, api_key=api_key, verbose=False)
 
@@ -488,29 +408,218 @@ def main(
             print("\nOne-time session complete. Exiting.")
             break
 
-        default_query = _get_prompt_section(prompts_cache, "Query")
+        runtime_prompt_vars = _build_runtime_prompt_vars(
+            backend=backend,
+            model_name=model_name,
+            selected_docs=selected_docs,
+            document_text=document_text,
+            query_index=answered_queries + 1,
+            output_mode=selected_output_mode,
+            output_template=output_template,
+        )
+        default_query_template = _get_prompt_section(prompts_cache, "Query")
+        default_query = _render_prompt_section(
+            section_text=default_query_template,
+            section_name="Query",
+            runtime_vars=runtime_prompt_vars,
+            prompt_vars=prompt_vars,
+        )
         query = prompt_query(default_query, prompt_yes_no)
-
         if query.lower() == "q":
             break
 
-        system_prompt = _get_prompt_section(prompts_cache, "System")
-
-        if system_prompt:
-            print("\nProcessing with System Instructions...")
-
-        query_kwargs = dict(
-            prompt=query,
-            context=document_text,
-            model=model_name,
-            use_subagents=use_subagents,
-            system_prompt=system_prompt,
-            subagent_backend=subagent_backend,
-            subagent_model=subagent_model,
-            max_iterations=max_iterations,
-            max_subagent_calls=max_subagent_calls,
+        runtime_prompt_vars["query"] = query
+        system_prompt = _render_prompt_section(
+            section_text=_get_prompt_section(prompts_cache, "System"),
+            section_name="System",
+            runtime_vars=runtime_prompt_vars,
+            prompt_vars=prompt_vars,
         )
-        response = _run_query_with_live_status(handler, query_kwargs)
+        effective_custom_prompt = custom_prompt or _render_prompt_section(
+            section_text=file_custom_prompt_template,
+            section_name="Custom Prompt",
+            runtime_vars=runtime_prompt_vars,
+            prompt_vars=prompt_vars,
+        )
+        effective_rlm_signature = rlm_signature or _render_prompt_section(
+            section_text=file_rlm_signature_template,
+            section_name="RLM Signature",
+            runtime_vars=runtime_prompt_vars,
+            prompt_vars=prompt_vars,
+        )
+
+        print("\nProcessing...")
+
+        retry_attempted = False
+        middle_out_retry_attempted = False
+        middle_out_primary_metrics: dict | None = None
+        retry_suffix = FORCE_SUBAGENT_QUERY_INSTRUCTION
+        response = ""
+        run_custom_prompt = effective_custom_prompt
+        run_root_lm_kwargs = dict(root_lm_kwargs) if root_lm_kwargs else None
+        run_subagent_lm_kwargs = dict(subagent_lm_kwargs) if subagent_lm_kwargs else None
+
+        while True:
+            query_kwargs = dict(
+                prompt=query,
+                context=document_text,
+                model=model_name,
+                use_subagents=use_subagents,
+                system_prompt=system_prompt,
+                subagent_backend=subagent_backend,
+                subagent_model=subagent_model,
+                max_iterations=max_iterations,
+                max_subagent_calls=max_llm_calls,
+                max_llm_calls=max_llm_calls,
+                max_output_chars=max_output_chars,
+                max_depth=max_depth,
+                custom_prompt=run_custom_prompt,
+                rlm_signature=effective_rlm_signature,
+                root_lm_kwargs=run_root_lm_kwargs,
+                subagent_lm_kwargs=run_subagent_lm_kwargs,
+                rlm_tools=rlm_tools,
+                rlm_interpreter=rlm_interpreter,
+                require_subagent_call=require_subagent_call,
+                subagent_prefetch_calls=(
+                    subagent_prefetch_calls
+                    if use_subagents and subagent_backend and subagent_model
+                    else 0
+                ),
+            )
+            response = _run_query_with_live_status(
+                handler,
+                query_kwargs,
+                timeout_seconds=query_timeout_seconds,
+            )
+
+            if not (
+                require_subagent_call
+                and require_subagent_call_retry_once
+                and not retry_attempted
+                and handler.last_metrics.get("error") == "required_subagent_call_missing"
+            ):
+                break
+
+            retry_attempted = True
+            print(
+                "Strict subagent-call check failed. Retrying once with forced llm_query instruction."
+            )
+            if run_custom_prompt:
+                run_custom_prompt = f"{run_custom_prompt}\n\n{retry_suffix}"
+            else:
+                run_custom_prompt = retry_suffix
+
+        while True:
+            context_limit = _parse_context_limit_error(response)
+            if not (
+                openrouter_auto_middle_out
+                and not middle_out_retry_attempted
+                and context_limit is not None
+                and (
+                    backend == "openrouter"
+                    or (use_subagents and subagent_backend == "openrouter")
+                )
+            ):
+                break
+
+            middle_out_retry_attempted = True
+            middle_out_primary_metrics = dict(handler.last_metrics)
+            max_tokens, requested_tokens = context_limit
+            print(
+                "Context overflow detected "
+                f"({requested_tokens} > {max_tokens} tokens). "
+                "Retrying once with OpenRouter middle-out transform."
+            )
+            if backend == "openrouter":
+                run_root_lm_kwargs = _with_openrouter_middle_out(run_root_lm_kwargs)
+            if use_subagents and subagent_backend == "openrouter":
+                run_subagent_lm_kwargs = _with_openrouter_middle_out(run_subagent_lm_kwargs)
+
+            response = _run_query_with_live_status(
+                handler,
+                dict(
+                    query_kwargs,
+                    root_lm_kwargs=run_root_lm_kwargs,
+                    subagent_lm_kwargs=run_subagent_lm_kwargs,
+                ),
+                timeout_seconds=query_timeout_seconds,
+            )
+
+        if middle_out_primary_metrics is not None:
+            handler.last_metrics = _merge_run_metrics_with_retry(
+                primary=middle_out_primary_metrics,
+                retry=dict(handler.last_metrics),
+                retry_label="middle_out",
+            )
+
+        primary_metrics = dict(handler.last_metrics)
+        if allow_research_direct_fallback and _should_use_research_direct_fallback(
+            output_mode=selected_output_mode,
+            use_subagents=use_subagents,
+            response=response,
+            metrics=primary_metrics,
+        ):
+            print("Research fallback: retrying with direct mode.")
+            direct_kwargs = dict(query_kwargs)
+            direct_kwargs["use_subagents"] = False
+            direct_kwargs["subagent_backend"] = None
+            direct_kwargs["subagent_model"] = None
+            direct_kwargs["subagent_lm_kwargs"] = None
+            direct_kwargs["rlm_tools"] = None
+            direct_kwargs["rlm_interpreter"] = None
+            direct_kwargs["require_subagent_call"] = False
+            direct_kwargs["custom_prompt"] = (
+                (run_custom_prompt or "")
+                + "\n\nReliability mode: provide the best research answer directly from context."
+            ).strip()
+            response = _run_query_with_live_status(
+                handler,
+                direct_kwargs,
+                timeout_seconds=query_timeout_seconds,
+            )
+            handler.last_metrics = _merge_run_metrics_with_fallback(
+                primary=primary_metrics,
+                fallback=dict(handler.last_metrics),
+            )
+
+        should_enforce_pdf_citations = (
+            enforce_pdf_page_citations
+            if enforce_pdf_page_citations is not None
+            else (selected_output_mode == "research")
+        )
+        if (
+            should_enforce_pdf_citations
+            and selected_pdf_docs
+            and not response.startswith("Error querying DSPy:")
+            and _response_has_pdf_page_na_citation(response, selected_pdf_docs)
+        ):
+            print("Citation enforcement: retrying once to resolve PDF page citations.")
+            citation_retry_kwargs = dict(query_kwargs)
+            if citation_repair_direct_mode:
+                citation_retry_kwargs["use_subagents"] = False
+                citation_retry_kwargs["subagent_backend"] = None
+                citation_retry_kwargs["subagent_model"] = None
+                citation_retry_kwargs["subagent_lm_kwargs"] = None
+                citation_retry_kwargs["rlm_tools"] = None
+                citation_retry_kwargs["rlm_interpreter"] = None
+                citation_retry_kwargs["require_subagent_call"] = False
+            citation_retry_kwargs["custom_prompt"] = (
+                (citation_retry_kwargs.get("custom_prompt") or "")
+                + "\n\nCitation strictness: for PDF sources, every citation must include a "
+                "numeric page from [Page N] markers. Do not output page: n/a for PDF sources."
+            ).strip()
+            citation_primary_metrics = dict(handler.last_metrics)
+            response = _run_query_with_live_status(
+                handler,
+                citation_retry_kwargs,
+                timeout_seconds=query_timeout_seconds,
+            )
+            handler.last_metrics = _merge_run_metrics_with_retry(
+                primary=citation_primary_metrics,
+                retry=dict(handler.last_metrics),
+                retry_label="citation_repair",
+            )
+
         print(f"\nResponse:\n{response}")
         _print_query_metrics(handler.last_metrics)
 

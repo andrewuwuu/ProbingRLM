@@ -1,5 +1,34 @@
 import os
+import shutil
+import subprocess
 from pypdf import PdfReader
+
+TEXT_LIKE_EXTENSIONS = {
+    ".doc",
+    ".docs",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".tsv",
+    ".xml",
+    ".html",
+    ".htm",
+    ".ini",
+    ".toml",
+    ".log",
+    ".rst",
+    ".sql",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+}
 
 
 def _is_probably_binary(data: bytes) -> bool:
@@ -60,12 +89,49 @@ def _load_docx(file_path: str) -> str:
         return ""
 
 
+def _load_doc(file_path: str) -> str:
+    """
+    Try common CLI converters for legacy .doc first, then fall back to plain-text decode.
+    """
+    converters = (
+        ["antiword", file_path],
+        ["catdoc", file_path],
+    )
+    for cmd in converters:
+        executable = cmd[0]
+        if not shutil.which(executable):
+            continue
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        if result.returncode == 0 and result.stdout:
+            text = result.stdout.decode("utf-8", errors="ignore").strip()
+            if text:
+                return text
+
+    fallback = _load_plain_text(file_path)
+    if fallback:
+        return fallback
+
+    print(
+        f"Could not extract .doc file {file_path}. "
+        "Install antiword/catdoc or convert it to .docx."
+    )
+    return ""
+
+
 def list_documents(directory: str) -> list[str]:
-    """List supported docs from a directory (pdf/docx/any probable text file)."""
+    """List supported docs from a directory (pdf/docx/text-like/any probable text file)."""
     if not os.path.isdir(directory):
         return []
 
-    supported_by_ext = {".pdf", ".docx", ".txt", ".md"}
+    supported_by_ext = {".pdf", ".docx"} | TEXT_LIKE_EXTENSIONS
     docs: list[str] = []
     for name in os.listdir(directory):
         path = os.path.join(directory, name)
@@ -94,9 +160,8 @@ def load_document(file_path: str) -> str:
         return load_pdf(file_path)
     if extension == ".docx":
         return _load_docx(file_path)
-    if extension == ".doc":
-        print(f"Legacy .doc is not supported directly ({file_path}). Convert it to .docx.")
-        return ""
+    if extension in {".doc", ".docs"}:
+        return _load_doc(file_path)
     return _load_plain_text(file_path)
 
 
@@ -112,10 +177,17 @@ def load_pdf(file_path: str) -> str:
     try:
         reader = PdfReader(file_path)
         text_parts: list[str] = []
-        for page in reader.pages:
+        for page_index, page in enumerate(reader.pages, start=1):
             page_text = page.extract_text() or ""
-            text_parts.append(page_text)
+            text_parts.append(f"[Page {page_index}]\n{page_text}".strip())
         return "\n".join(text_parts).strip()
     except Exception as e:
-        print(f"Error reading PDF {file_path}: {e}")
+        message = str(e)
+        if "cryptography>=3.1 is required for AES algorithm" in message:
+            print(
+                f"Error reading PDF {file_path}: {message}. "
+                "Install dependencies with `uv sync` (or `uv add cryptography`)."
+            )
+            return ""
+        print(f"Error reading PDF {file_path}: {message}")
         return ""

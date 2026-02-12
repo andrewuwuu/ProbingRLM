@@ -1,13 +1,15 @@
 [project]
 name = "ProbingRLM"
 version = "0.1.0"
-description = "CLI document retrieval tool built on the rlms library."
+description = "CLI document retrieval tool built on DSPy."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=45.0.0",
     "markdown-pdf>=1.11",
     "pypdf>=6.7.0",
     "python-docx>=1.2.0",
     "python-dotenv>=1.2.1",
-    "rlms>=0.1.0",
+    "dspy>=3.1.3",
+    "pytest>=9.0.2",
 ]

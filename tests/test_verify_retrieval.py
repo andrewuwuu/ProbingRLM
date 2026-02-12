@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,23 @@ from src import pdf_utils
 from src import rlm_handler
 
 
+class _FakeLM:
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.history: list[dict] = []
+        self.last_messages = None
+
+    def __call__(self, *, messages):
+        self.last_messages = messages
+        self.history.append(
+            {
+                "model": self.model,
+                "usage": {"prompt_tokens": 120, "completion_tokens": 45},
+            }
+        )
+        return ["Mocked Response"]
+
+
 class TestPDFRetrieval(unittest.TestCase):
     def test_list_documents_includes_supported_and_text_like_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -19,6 +37,7 @@ class TestPDFRetrieval(unittest.TestCase):
                 "paper.pdf": b"%PDF-1.7\nfake\n",
                 "notes.md": b"# Notes\nhello\n",
                 "readme.txt": b"plain text\n",
+                "config.json": b"{\"hello\": \"world\"}\n",
                 "draft.docx": b"PK\x03\x04fake-docx-binary",
                 "noext": b"just some text with no extension",
                 "image.bin": b"\x00\x01\x02\x03\x04",
@@ -32,6 +51,7 @@ class TestPDFRetrieval(unittest.TestCase):
             self.assertIn("paper.pdf", listed)
             self.assertIn("notes.md", listed)
             self.assertIn("readme.txt", listed)
+            self.assertIn("config.json", listed)
             self.assertIn("draft.docx", listed)
             self.assertIn("noext", listed)
             self.assertNotIn("image.bin", listed)
@@ -55,7 +75,7 @@ class TestPDFRetrieval(unittest.TestCase):
 
         text = pdf_utils.load_pdf("dummy.pdf")
 
-        self.assertEqual(text, "Page text\nPage text")
+        self.assertEqual(text, "[Page 1]\nPage text\n[Page 2]\nPage text")
         mock_pdf_reader.assert_called_with("dummy.pdf")
 
     @patch("src.pdf_utils.load_pdf")
@@ -72,6 +92,13 @@ class TestPDFRetrieval(unittest.TestCase):
         self.assertEqual(result, "docx text")
         mock_load_docx.assert_called_once_with("sample.docx")
 
+    @patch("src.pdf_utils._load_doc")
+    def test_load_document_routes_doc(self, mock_load_doc):
+        mock_load_doc.return_value = "doc text"
+        result = pdf_utils.load_document("sample.doc")
+        self.assertEqual(result, "doc text")
+        mock_load_doc.assert_called_once_with("sample.doc")
+
     def test_load_document_reads_plain_text_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             file_path = os.path.join(tmpdir, "sample.log")
@@ -81,259 +108,314 @@ class TestPDFRetrieval(unittest.TestCase):
             result = pdf_utils.load_document(file_path)
             self.assertEqual(result, "hello from text file")
 
-    @patch("src.rlm_handler.get_client")
-    @patch("src.rlm_handler.rlm.RLM")
-    def test_rlm_query_without_subagents(self, mock_rlm_class, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.completion.return_value = "Mocked Response"
-        mock_client.model_name = "openai/gpt-4.1-mini"
-        mock_client.get_last_usage.return_value = SimpleNamespace(
-            total_calls=1,
-            total_input_tokens=120,
-            total_output_tokens=45,
-        )
-        mock_get_client.return_value = mock_client
+    def test_load_document_reads_json_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = os.path.join(tmpdir, "sample.json")
+            with open(file_path, "w", encoding="utf-8") as handle:
+                handle.write("{\"name\": \"test\", \"ok\": true}")
+
+            result = pdf_utils.load_document(file_path)
+            self.assertIn("\"name\": \"test\"", result)
+
+    @patch.object(rlm_handler, "dspy", new=SimpleNamespace(LM=object))
+    @patch.object(rlm_handler.RLMHandler, "_build_lm")
+    def test_query_without_subagents_uses_direct_lm(self, mock_build_lm):
+        lm = _FakeLM("openai/gpt-4.1-mini")
+        mock_build_lm.return_value = lm
 
         handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        response = handler.query("Test Prompt", "Test Context")
+        response = handler.query(
+            "Test Prompt",
+            "Test Context",
+            system_prompt="System instructions",
+            custom_prompt="Custom instructions",
+        )
 
         self.assertEqual(response, "Mocked Response")
-        mock_get_client.assert_called_once_with("openrouter", {})
-        mock_rlm_class.assert_not_called()
-
-        call_args = mock_client.completion.call_args.args
-        self.assertEqual(len(call_args), 1)
-        self.assertIn("Test Prompt", call_args[0])
-        self.assertIn("Test Context", call_args[0])
+        self.assertIn("Test Prompt", lm.last_messages[1]["content"])
+        self.assertIn("Test Context", lm.last_messages[1]["content"])
+        self.assertEqual(lm.last_messages[0]["role"], "system")
+        self.assertIn("System instructions", lm.last_messages[0]["content"])
+        self.assertIn("Custom instructions", lm.last_messages[0]["content"])
         self.assertEqual(handler.last_metrics["mode"], "direct_lm")
         self.assertEqual(handler.last_metrics["total_input_tokens"], 120)
         self.assertEqual(handler.last_metrics["total_output_tokens"], 45)
         self.assertEqual(handler.last_metrics["total_tokens"], 165)
 
-    @patch("src.rlm_handler.get_client")
-    def test_rlm_query_without_subagents_with_system_prompt(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.completion.return_value = "Mocked Response"
-        mock_get_client.return_value = mock_client
+    @patch.object(rlm_handler.RLMHandler, "_build_signature")
+    @patch.object(rlm_handler.RLMHandler, "_build_lm")
+    def test_query_with_subagents_uses_dspy_rlm(
+        self,
+        mock_build_lm,
+        mock_build_signature,
+    ):
+        root_lm = SimpleNamespace(model="openai/gpt-5-mini", history=[])
+        sub_lm = SimpleNamespace(model="gpt-4.1-mini", history=[])
 
-        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        handler.query("Prompt", "Context", system_prompt="System instructions")
-
-        payload = mock_client.completion.call_args.args[0]
-        self.assertEqual(payload[0]["role"], "system")
-        self.assertEqual(payload[0]["content"], "System instructions")
-        self.assertEqual(payload[1]["role"], "user")
-        self.assertIn("Prompt", payload[1]["content"])
-
-    @patch("src.rlm_handler.rlm.RLM")
-    def test_rlm_query_with_subagents(self, mock_rlm_class):
-        mock_agent = MagicMock()
-        completion = MagicMock()
-        completion.response = "Mocked Recursive Response"
-        completion.execution_time = 2.5
-        completion.usage_summary = SimpleNamespace(
-            model_usage_summaries={
-                "openai/gpt-5-mini": SimpleNamespace(
-                    total_calls=3,
-                    total_input_tokens=220,
-                    total_output_tokens=80,
-                ),
-                "gpt-4.1-mini": SimpleNamespace(
-                    total_calls=2,
-                    total_input_tokens=100,
-                    total_output_tokens=40,
-                ),
-            }
+        mock_build_lm.side_effect = [root_lm, sub_lm]
+        fake_signature = SimpleNamespace(
+            input_fields={"context": object(), "query": object(), "guidance": object()}
         )
-        mock_agent.completion.return_value = completion
-        mock_rlm_class.return_value = mock_agent
+        mock_build_signature.return_value = fake_signature
 
-        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        response = handler.query(
-            "Prompt",
-            "Context",
-            model="openai/gpt-5-mini",
-            use_subagents=True,
-            system_prompt="SysPrompt",
-            subagent_backend="openai",
-            subagent_model="gpt-4.1-mini",
-            max_iterations=12,
-            max_subagent_calls=8,
+        def fake_agent_call(*, context, query, guidance):
+            self.assertEqual(context, "Context")
+            self.assertEqual(query, "Prompt")
+            self.assertIn("SysPrompt", guidance)
+            self.assertIn("Depth policy", guidance)
+            root_lm.history.append(
+                {
+                    "model": root_lm.model,
+                    "usage": {"prompt_tokens": 220, "completion_tokens": 80},
+                }
+            )
+            sub_lm.history.append(
+                {
+                    "model": sub_lm.model,
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 40},
+                }
+            )
+            return SimpleNamespace(answer="Mocked Recursive Response", trajectory=["i1", "i2"])
+
+        mock_agent = MagicMock(side_effect=fake_agent_call)
+        mock_rlm_ctor = MagicMock(return_value=mock_agent)
+        fake_dspy = SimpleNamespace(
+            context=lambda **_: nullcontext(),
+            RLM=mock_rlm_ctor,
         )
+
+        with patch.object(rlm_handler, "dspy", new=fake_dspy):
+            handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+            response = handler.query(
+                "Prompt",
+                "Context",
+                model="openai/gpt-5-mini",
+                use_subagents=True,
+                system_prompt="SysPrompt",
+                subagent_backend="openai",
+                subagent_model="gpt-4.1-mini",
+                max_iterations=12,
+                max_llm_calls=8,
+                max_output_chars=5000,
+                max_depth=3,
+                rlm_signature="context, query, instructions -> answer",
+            )
 
         self.assertEqual(response, "Mocked Recursive Response")
-        mock_rlm_class.assert_called_once()
-
-        rlm_init = mock_rlm_class.call_args.kwargs
-        self.assertEqual(rlm_init.get("backend_kwargs", {}).get("model_name"), "openai/gpt-5-mini")
-        self.assertEqual(rlm_init.get("max_depth"), 1)
+        mock_rlm_ctor.assert_called_once()
+        rlm_init = mock_rlm_ctor.call_args.kwargs
         self.assertEqual(rlm_init.get("max_iterations"), 12)
-        self.assertIn("SysPrompt", rlm_init.get("custom_system_prompt", ""))
-        self.assertIn("Before FINAL, make at least one llm_query", rlm_init.get("custom_system_prompt", ""))
-        self.assertEqual(rlm_init.get("other_backends"), ["openai"])
-        self.assertEqual(
-            rlm_init.get("other_backend_kwargs"),
-            [{"model_name": "gpt-4.1-mini"}],
-        )
+        self.assertEqual(rlm_init.get("max_llm_calls"), 8)
+        self.assertEqual(rlm_init.get("max_output_chars"), 5000)
+        self.assertEqual(rlm_init.get("sub_lm"), sub_lm)
+        self.assertEqual(rlm_init.get("signature"), fake_signature)
 
-        completion_call = mock_agent.completion.call_args.kwargs
-        self.assertEqual(completion_call.get("prompt"), "Context")
-        self.assertEqual(completion_call.get("root_prompt"), "Prompt")
-        self.assertEqual(handler.last_metrics["mode"], "rlm_subagents")
+        self.assertEqual(handler.last_metrics["mode"], "dspy_rlm")
         self.assertEqual(handler.last_metrics["configured_subagent_model"], "gpt-4.1-mini")
+        self.assertEqual(handler.last_metrics["subagent_calls"], 1)
+        self.assertEqual(handler.last_metrics["iterations"], 2)
         self.assertEqual(handler.last_metrics["total_input_tokens"], 320)
         self.assertEqual(handler.last_metrics["total_output_tokens"], 120)
         self.assertEqual(handler.last_metrics["total_tokens"], 440)
 
-    def test_guarded_logger_raises_on_subagent_budget_exceeded(self):
-        logger = rlm_handler._GuardedRLMLogger(max_subagent_calls=1)
-        iter_one = SimpleNamespace(
-            code_blocks=[SimpleNamespace(result=SimpleNamespace(rlm_calls=["call-1"]))]
+    @patch.object(rlm_handler.RLMHandler, "_build_signature")
+    @patch.object(rlm_handler.RLMHandler, "_build_lm")
+    def test_query_with_subagent_prefetch_makes_sub_calls(
+        self,
+        mock_build_lm,
+        mock_build_signature,
+    ):
+        class _FakeSubLM:
+            def __init__(self):
+                self.model = "openrouter/stepfun/step-3.5-flash:free"
+                self.history = []
+
+            def __call__(self, *, messages):
+                self.history.append(
+                    {
+                        "model": self.model,
+                        "usage": {"prompt_tokens": 40, "completion_tokens": 20},
+                    }
+                )
+                return ["prefetch evidence"]
+
+        root_lm = SimpleNamespace(model="openrouter/arcee-ai/trinity-large-preview:free", history=[])
+        sub_lm = _FakeSubLM()
+
+        mock_build_lm.side_effect = [root_lm, sub_lm]
+        fake_signature = SimpleNamespace(
+            input_fields={"context": object(), "query": object(), "guidance": object()}
         )
-        iter_two = SimpleNamespace(
-            code_blocks=[SimpleNamespace(result=SimpleNamespace(rlm_calls=["call-2"]))]
+        mock_build_signature.return_value = fake_signature
+
+        def fake_agent_call(*, context, query, guidance):
+            root_lm.history.append(
+                {
+                    "model": root_lm.model,
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 30},
+                }
+            )
+            self.assertIn("Subagent pre-analysis", guidance)
+            return SimpleNamespace(answer="ok", trajectory=["i1"])
+
+        mock_rlm_ctor = MagicMock(return_value=MagicMock(side_effect=fake_agent_call))
+        fake_dspy = SimpleNamespace(
+            context=lambda **_: nullcontext(),
+            RLM=mock_rlm_ctor,
         )
 
-        logger.log(iter_one)
-        self.assertEqual(logger.subagent_calls, 1)
-        with self.assertRaises(RuntimeError):
-            logger.log(iter_two)
+        with patch.object(rlm_handler, "dspy", new=fake_dspy):
+            handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+            response = handler.query(
+                "Prompt",
+                "Context",
+                model="arcee-ai/trinity-large-preview:free",
+                use_subagents=True,
+                subagent_backend="openrouter",
+                subagent_model="stepfun/step-3.5-flash:free",
+                subagent_prefetch_calls=2,
+            )
 
-    @patch("src.rlm_handler.rlm.RLM")
-    def test_rlm_query_reports_subagent_call_guard_violation(self, mock_rlm_class):
-        mock_agent = MagicMock()
-        mock_agent.completion.side_effect = RuntimeError(
-            "Max subagent calls exceeded: 2 > 1"
+        self.assertEqual(response, "ok")
+        self.assertEqual(handler.last_metrics["subagent_calls"], 2)
+
+    @patch.object(rlm_handler.RLMHandler, "_build_signature")
+    @patch.object(rlm_handler.RLMHandler, "_build_lm")
+    def test_query_with_strict_subagent_call_fails_when_no_subagent_calls(
+        self,
+        mock_build_lm,
+        mock_build_signature,
+    ):
+        root_lm = SimpleNamespace(model="openrouter/openai/gpt-5-mini", history=[])
+        sub_lm = SimpleNamespace(model="openrouter/stepfun/step-3.5-flash:free", history=[])
+
+        mock_build_lm.side_effect = [root_lm, sub_lm]
+        fake_signature = SimpleNamespace(
+            input_fields={"context": object(), "query": object(), "guidance": object()}
         )
-        mock_rlm_class.return_value = mock_agent
+        mock_build_signature.return_value = fake_signature
 
+        def fake_agent_call(*, context, query, guidance):
+            self.assertEqual(context, "Context")
+            self.assertEqual(query, "Prompt")
+            self.assertIn("Depth policy", guidance)
+            root_lm.history.append(
+                {
+                    "model": root_lm.model,
+                    "usage": {"prompt_tokens": 180, "completion_tokens": 60},
+                }
+            )
+            return SimpleNamespace(answer="Should fail strict mode", trajectory=["i1"])
+
+        mock_agent = MagicMock(side_effect=fake_agent_call)
+        mock_rlm_ctor = MagicMock(return_value=mock_agent)
+        fake_dspy = SimpleNamespace(
+            context=lambda **_: nullcontext(),
+            RLM=mock_rlm_ctor,
+        )
+
+        with patch.object(rlm_handler, "dspy", new=fake_dspy):
+            handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+            response = handler.query(
+                "Prompt",
+                "Context",
+                model="openai/gpt-5-mini",
+                use_subagents=True,
+                system_prompt="SysPrompt",
+                subagent_backend="openrouter",
+                subagent_model="stepfun/step-3.5-flash:free",
+                max_iterations=6,
+                max_llm_calls=4,
+                max_output_chars=4000,
+                max_depth=2,
+                require_subagent_call=True,
+            )
+
+        self.assertIn("strict subagent-call mode is enabled", response)
+        self.assertEqual(handler.last_metrics["mode"], "dspy_rlm")
+        self.assertEqual(handler.last_metrics["subagent_calls"], 0)
+        self.assertEqual(
+            handler.last_metrics["error"],
+            "required_subagent_call_missing",
+        )
+
+    def test_query_rejects_partial_subagent_config(self):
         handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        response = handler.query(
-            "Prompt",
-            "Context",
-            model="openai/gpt-5-mini",
-            use_subagents=True,
-            max_subagent_calls=1,
-        )
+        with self.assertRaises(ValueError):
+            handler.query(
+                "Prompt",
+                "Context",
+                model="openai/gpt-5-mini",
+                use_subagents=True,
+                subagent_backend="openai",
+                subagent_model=None,
+            )
 
-        self.assertIn("Max subagent calls exceeded", response)
-        self.assertTrue(handler.last_metrics.get("max_subagent_calls_exceeded"))
-        self.assertEqual(handler.last_metrics.get("max_subagent_calls"), 1)
-
-    def test_rlm_query_rejects_partial_subagent_config(self):
-        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        response = handler.query(
-            "Prompt",
-            "Context",
-            model="openai/gpt-5-mini",
-            use_subagents=True,
-            subagent_backend="openai",
-            subagent_model=None,
-        )
-        self.assertIn("Both subagent_backend and subagent_model", response)
-
-    def test_compose_rlm_system_prompt_keeps_core_instructions(self):
-        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        prompt = handler._compose_rlm_system_prompt(
-            user_system_prompt="Prioritize concise answers.",
+    def test_compose_rlm_guidance_includes_user_custom_and_depth(self):
+        prompt = rlm_handler.RLMHandler._compose_rlm_guidance(
+            system_prompt="Prioritize concise answers.",
+            custom_prompt="Use bullet points.",
+            max_depth=4,
             subagent_model="gpt-4.1-mini",
         )
-        self.assertIn("You are tasked with answering a query with associated context.", prompt)
         self.assertIn("Prioritize concise answers.", prompt)
+        self.assertIn("Use bullet points.", prompt)
         self.assertIn("gpt-4.1-mini", prompt)
-        self.assertIn("Before FINAL, make at least one llm_query", prompt)
-        self.assertIn("Never call FINAL_VAR", prompt)
+        self.assertIn("Depth policy", prompt)
 
-    def test_compose_rlm_system_prompt_without_alt_subagent_model(self):
+    def test_normalize_rlm_signature_rewrites_instructions_field(self):
+        signature = rlm_handler.RLMHandler._normalize_rlm_signature(
+            "context, query, instructions -> answer"
+        )
+        self.assertEqual(signature, "context, query, guidance -> answer")
+
+    def test_resolve_model_name_supports_openrouter_free_aliases(self):
         handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        prompt = handler._compose_rlm_system_prompt(
-            user_system_prompt=None,
-            subagent_model=None,
+        self.assertEqual(
+            handler._resolve_model_name("openrouter", "openrouter/free"),
+            "openrouter/free",
         )
-        self.assertIn(
-            "llm_query calls use the root model by default when no alternate subagent backend/model is configured.",
-            prompt,
+        self.assertEqual(
+            handler._resolve_model_name("openrouter", "free"),
+            "openrouter/free",
         )
-        self.assertIn("Before FINAL, make at least one llm_query", prompt)
+        self.assertEqual(
+            handler._resolve_model_name("openrouter", "arcee-ai/trinity-large-preview:free"),
+            "openrouter/arcee-ai/trinity-large-preview:free",
+        )
+        self.assertEqual(
+            handler._resolve_model_name("openrouter", "gpt-4.1-mini"),
+            "openrouter/openai/gpt-4.1-mini",
+        )
 
-    @patch("src.rlm_handler.rlm.RLM")
-    def test_rlm_query_with_subagents_same_model_uses_default_routing(self, mock_rlm_class):
-        mock_agent = MagicMock()
-        completion = MagicMock()
-        completion.response = "Recursive response on root model."
-        completion.execution_time = 1.0
-        completion.usage_summary = SimpleNamespace(model_usage_summaries={})
-        mock_agent.completion.return_value = completion
-        mock_rlm_class.return_value = mock_agent
+    def test_adapt_model_for_litellm_backend_handles_openrouter_router_ids(self):
+        self.assertEqual(
+            rlm_handler.RLMHandler._adapt_model_for_litellm_backend(
+                "openrouter",
+                "openrouter/free",
+            ),
+            "openrouter/openrouter/free",
+        )
+        self.assertEqual(
+            rlm_handler.RLMHandler._adapt_model_for_litellm_backend(
+                "openrouter",
+                "openrouter/stepfun/step-3.5-flash:free",
+            ),
+            "openrouter/stepfun/step-3.5-flash:free",
+        )
+        self.assertEqual(
+            rlm_handler.RLMHandler._adapt_model_for_litellm_backend(
+                "openai",
+                "openai/gpt-4.1-mini",
+            ),
+            "openai/gpt-4.1-mini",
+        )
 
+    @patch.object(rlm_handler, "dspy", new=None)
+    def test_query_reports_missing_dspy_dependency(self):
         handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        handler.query(
-            "Prompt",
-            "Context",
-            model="openai/gpt-5-mini",
-            use_subagents=True,
-            subagent_backend=None,
-            subagent_model=None,
-        )
-
-        rlm_init = mock_rlm_class.call_args.kwargs
-        self.assertEqual(rlm_init.get("backend_kwargs", {}).get("model_name"), "openai/gpt-5-mini")
-        self.assertNotIn("other_backends", rlm_init)
-        self.assertIn(
-            "llm_query calls use the root model by default",
-            rlm_init.get("custom_system_prompt", ""),
-        )
-        self.assertIn(
-            "Before FINAL, make at least one llm_query",
-            rlm_init.get("custom_system_prompt", ""),
-        )
-
-    @patch("src.rlm_handler.get_client")
-    @patch("src.rlm_handler.rlm.RLM")
-    def test_rlm_query_recovers_from_final_var_error(self, mock_rlm_class, mock_get_client):
-        bad_1 = MagicMock()
-        bad_1.response = (
-            "Error: Variable 'x' not found. Available variables: ['context']. "
-            "You must create and assign a variable BEFORE calling FINAL_VAR on it."
-        )
-        bad_1.execution_time = 1.0
-        bad_1.usage_summary = SimpleNamespace(model_usage_summaries={})
-
-        bad_2 = MagicMock()
-        bad_2.response = bad_1.response
-        bad_2.execution_time = 1.2
-        bad_2.usage_summary = SimpleNamespace(model_usage_summaries={})
-
-        mock_agent = MagicMock()
-        mock_agent.completion.side_effect = [bad_1, bad_2]
-        mock_rlm_class.return_value = mock_agent
-
-        fallback_client = MagicMock()
-        fallback_client.model_name = "openai/gpt-5-mini"
-        fallback_client.completion.return_value = "Fallback answer."
-        fallback_client.get_last_usage.return_value = SimpleNamespace(
-            total_calls=1,
-            total_input_tokens=10,
-            total_output_tokens=4,
-        )
-        mock_get_client.return_value = fallback_client
-
-        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
-        response = handler.query(
-            "Prompt",
-            "Context",
-            model="openai/gpt-5-mini",
-            use_subagents=True,
-            subagent_backend="openai",
-            subagent_model="gpt-4.1-mini",
-        )
-
-        self.assertIn("[Recovered after RLM FINAL_VAR failure", response)
-        self.assertIn("Fallback answer.", response)
-        self.assertEqual(mock_agent.completion.call_count, 2)
-        self.assertTrue(handler.last_metrics.get("retry_attempted"))
-        self.assertTrue(handler.last_metrics.get("fallback_used"))
-        self.assertTrue(handler.last_metrics.get("unresolved_final_var_error"))
+        response = handler.query("Prompt", "Context")
+        self.assertIn("dspy is not installed", response.lower())
 
 
 if __name__ == "__main__":
