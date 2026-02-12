@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -159,7 +160,7 @@ class TestCliBackends(unittest.TestCase):
         concise_template = cli_app._output_template_for_mode("concise")
         research_template = cli_app._output_template_for_mode("research")
         self.assertIn("2-4 bullets", concise_template)
-        self.assertIn("3-8 bullets", research_template)
+        self.assertIn("Evidence Map (6-12 bullets", research_template)
 
     @patch.dict(os.environ, {"DSPY_RLM_MAX_ITERATIONS": "12"}, clear=True)
     def test_parse_positive_int_env_returns_value(self):
@@ -281,6 +282,58 @@ class TestCliBackends(unittest.TestCase):
             cli_app._resolve_root_model_default("openrouter"),
             "openrouter/openai/gpt-4.1-mini",
         )
+
+    def test_model_requires_no_json_fallback_for_stepfun(self):
+        self.assertTrue(
+            cli_app._model_requires_no_json_fallback(
+                "openrouter/stepfun/step-3.5-flash:free"
+            )
+        )
+        self.assertFalse(
+            cli_app._model_requires_no_json_fallback(
+                "openrouter/openai/gpt-5-nano"
+            )
+        )
+
+    def test_load_prompt_config_from_dir_prefers_single_bundle_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "config.md")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# Question\nWhat is the thesis?\n\n"
+                    "# Scope\nUse only cited text.\n\n"
+                    "# System\nBe strict with citations.\n\n"
+                    "# Signature\ncontext, query -> answer\n\n"
+                    "# Output Template\n1. Answer"
+                )
+            loaded = cli_app._load_prompt_config_from_dir(tmpdir)
+            self.assertEqual(loaded["question"], "What is the thesis?")
+            self.assertEqual(loaded["scope"], "Use only cited text.")
+            self.assertEqual(loaded["system_prompt"], "Be strict with citations.")
+            self.assertEqual(loaded["rlm_signature"], "context, query -> answer")
+            self.assertEqual(loaded["output_template"], "1. Answer")
+
+    def test_load_prompt_config_from_dir_keeps_legacy_file_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.md"), "w", encoding="utf-8") as handle:
+                handle.write("# Question\nQuestion from bundle")
+            with open(os.path.join(tmpdir, "question.md"), "w", encoding="utf-8") as handle:
+                handle.write("Question from file")
+            loaded = cli_app._load_prompt_config_from_dir(tmpdir)
+            self.assertEqual(loaded["question"], "Question from file")
+
+    def test_build_query_payload_contains_required_sections(self):
+        payload = cli_app._build_query_payload(
+            question="What happened?",
+            scope="Limit to chapter 1.",
+            output_mode="research",
+            output_template="1. Thesis",
+        )
+        self.assertIn("Research question:", payload)
+        self.assertIn("Scope and constraints:", payload)
+        self.assertIn("Requested output mode: research", payload)
+        self.assertIn("Required output structure:", payload)
+        self.assertIn("Citation format reminder:", payload)
 
 
 if __name__ == "__main__":

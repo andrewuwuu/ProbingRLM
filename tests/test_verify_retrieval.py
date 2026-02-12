@@ -31,6 +31,73 @@ class _FakeLM:
 
 
 class TestPDFRetrieval(unittest.TestCase):
+    def test_tracing_lm_proxy_is_baselm_and_forwards_messages_only(self):
+        if rlm_handler.dspy is None:
+            self.skipTest("dspy is not installed")
+
+        class _CallOnlyLM:
+            def __init__(self):
+                self.model = "openrouter/openai/gpt-5-mini"
+                self.model_type = "chat"
+                self.temperature = 0.0
+                self.max_tokens = 1000
+                self.cache = True
+                self.history = []
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                self.history.append(
+                    {
+                        "model": self.model,
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+                    }
+                )
+                return ["ok"]
+
+        raw_lm = _CallOnlyLM()
+        proxy = rlm_handler._TracingLMProxy(raw_lm, "root:test")
+
+        self.assertTrue(isinstance(proxy, rlm_handler.dspy.BaseLM))
+        out = proxy(messages=[{"role": "user", "content": "hello"}])
+        self.assertEqual(out, ["ok"])
+        self.assertEqual(len(raw_lm.calls), 1)
+        self.assertIn("messages", raw_lm.calls[0])
+        self.assertNotIn("prompt", raw_lm.calls[0])
+
+    def test_tracing_lm_proxy_forwards_prompt_only(self):
+        if rlm_handler.dspy is None:
+            self.skipTest("dspy is not installed")
+
+        class _CallOnlyLM:
+            def __init__(self):
+                self.model = "openrouter/openai/gpt-5-mini"
+                self.model_type = "chat"
+                self.temperature = 0.0
+                self.max_tokens = 1000
+                self.cache = True
+                self.history = []
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                self.history.append(
+                    {
+                        "model": self.model,
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                    }
+                )
+                return ["ok"]
+
+        raw_lm = _CallOnlyLM()
+        proxy = rlm_handler._TracingLMProxy(raw_lm, "root:test")
+
+        out = proxy(prompt="hi")
+        self.assertEqual(out, ["ok"])
+        self.assertEqual(len(raw_lm.calls), 1)
+        self.assertIn("prompt", raw_lm.calls[0])
+        self.assertNotIn("messages", raw_lm.calls[0])
+
     def test_list_documents_includes_supported_and_text_like_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             files = {
@@ -338,6 +405,60 @@ class TestPDFRetrieval(unittest.TestCase):
             handler.last_metrics["error"],
             "required_subagent_call_missing",
         )
+
+    @patch.object(rlm_handler.RLMHandler, "_build_signature")
+    @patch.object(rlm_handler.RLMHandler, "_build_lm")
+    def test_query_builds_explicit_sub_lm_even_without_dedicated_subagent_config(
+        self,
+        mock_build_lm,
+        mock_build_signature,
+    ):
+        root_lm = SimpleNamespace(model="openrouter/openai/gpt-5-mini", history=[])
+        sub_lm = SimpleNamespace(model="openrouter/openai/gpt-5-mini", history=[])
+
+        mock_build_lm.side_effect = [root_lm, sub_lm]
+        fake_signature = SimpleNamespace(
+            input_fields={"context": object(), "query": object(), "guidance": object()}
+        )
+        mock_build_signature.return_value = fake_signature
+
+        def fake_agent_call(*, context, query, guidance):
+            root_lm.history.append(
+                {
+                    "model": root_lm.model,
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 20},
+                }
+            )
+            sub_lm.history.append(
+                {
+                    "model": sub_lm.model,
+                    "usage": {"prompt_tokens": 60, "completion_tokens": 10},
+                }
+            )
+            return SimpleNamespace(answer="ok", trajectory=["i1"])
+
+        mock_rlm_ctor = MagicMock(return_value=MagicMock(side_effect=fake_agent_call))
+        fake_dspy = SimpleNamespace(
+            context=lambda **_: nullcontext(),
+            RLM=mock_rlm_ctor,
+        )
+
+        with patch.object(rlm_handler, "dspy", new=fake_dspy):
+            handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+            response = handler.query(
+                "Prompt",
+                "Context",
+                model="openai/gpt-5-mini",
+                use_subagents=True,
+            )
+
+        self.assertEqual(response, "ok")
+        self.assertEqual(mock_build_lm.call_count, 2)
+        sub_call = mock_build_lm.call_args_list[1]
+        self.assertEqual(sub_call.kwargs["backend"], "openrouter")
+        self.assertEqual(sub_call.kwargs["model"], "openai/gpt-5-mini")
+        self.assertEqual(sub_call.kwargs["explicit_api_key"], "sk-test")
+        self.assertEqual(handler.last_metrics["configured_subagent_model"], sub_lm.model)
 
     def test_query_rejects_partial_subagent_config(self):
         handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")

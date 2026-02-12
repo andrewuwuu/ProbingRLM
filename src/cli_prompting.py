@@ -62,12 +62,14 @@ def _output_template_for_mode(mode: str) -> str:
             "4. Confidence: High | Medium | Low"
         )
     return (
-        "1. Direct Answer (2-6 sentences)\n"
-        "2. Evidence (3-8 bullets with short quotes and citations)\n"
-        "3. Analysis (how evidence supports the answer)\n"
-        "4. Conflicts / Ambiguities (if any)\n"
-        "5. Missing Evidence (if any)\n"
-        "6. Confidence: High | Medium | Low"
+        "1. Thesis (1 dense paragraph)\n"
+        "2. Evidence Map (6-12 bullets: short quote + citation + one-line relevance)\n"
+        "3. Analytical Synthesis (3-6 paragraphs linking evidence to the research question)\n"
+        "4. Theoretical / Comparative Lens (1-3 paragraphs; label inference explicitly)\n"
+        "5. Gaps and Limits (explicit unsupported claims; use exact phrase "
+        "'Not found in provided document context' per missing claim)\n"
+        "6. Conclusion (1 paragraph)\n"
+        "7. Confidence: High | Medium | Low (with brief reason)"
     )
 
 

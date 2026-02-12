@@ -51,6 +51,21 @@ def _parse_positive_int_env(var_name: str) -> int | None:
     return value
 
 
+def _parse_non_negative_int_env(var_name: str) -> int | None:
+    raw = (os.getenv(var_name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"Ignoring {var_name}: expected integer but got '{raw}'.")
+        return None
+    if value < 0:
+        print(f"Ignoring {var_name}: expected >= 0 but got '{value}'.")
+        return None
+    return value
+
+
 def _parse_positive_float_env(var_name: str) -> float | None:
     raw = (os.getenv(var_name) or "").strip()
     if not raw:

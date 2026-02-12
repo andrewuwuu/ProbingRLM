@@ -21,11 +21,12 @@ DSPY_MODEL=openrouter/free
 ## What It Supports
 
 - Documents from `embed-docs/`: `.pdf`, `.docx`, `.doc/.docs`, `.md`, `.txt`, `.json`, `.yaml`, `.csv`, and other text-like files.
+- Prompt configuration folder (`prompt-config/`) with a single `config.md` (plus legacy per-file support).
 - Modes:
   - direct model call
   - DSPy RLM recursive mode (optional subagent backend/model)
   - Research safety fallback: if recursive research run times out/stalls, it retries once in direct mode
-- Programmable prompt presets from `prompts.md` (`Variables`, `System`, `Custom Prompt`, `Query`, `RLM Signature`)
+- Optional programmable prompt presets from `prompts.md` (`Variables`, `System`, `Custom Prompt`, `Query`, `RLM Signature`)
 - Switchable answer style: `research` (full, citation-heavy) or `concise` (short summary with citations)
 - Save response as Markdown and/or PDF
 - Runtime metrics (tokens, iterations, model usage)
@@ -64,6 +65,8 @@ RLM customization:
 DSPY_RLM_SIGNATURE=context, query -> answer
 DSPY_CUSTOM_PROMPT=Prefer concise answers.
 DSPY_OUTPUT_MODE=research
+DSPY_USE_PROMPTS_FILE=false
+DSPY_PROMPT_CONFIG_DIR=prompt-config
 DSPY_QUERY_TIMEOUT_SECONDS=180
 DSPY_REQUIRE_SUBAGENT_CALL=false
 DSPY_REQUIRE_SUBAGENT_CALL_RETRY_ONCE=false
@@ -71,6 +74,12 @@ DSPY_ENFORCE_PDF_PAGE_CITATIONS=true
 DSPY_RESEARCH_ALLOW_DIRECT_FALLBACK=true
 DSPY_CITATION_REPAIR_DIRECT_MODE=false
 DSPY_OPENROUTER_AUTO_MIDDLE_OUT=true
+DSPY_RLM_VERBOSE=false
+DSPY_LIVE_LM_LOGS=false
+DSPY_DISABLE_JSON_ADAPTER_FALLBACK=true
+DSPY_CONTEXT_MAX_CHARS=260000
+DSPY_CONTEXT_CHUNK_CHARS=2200
+DSPY_CONTEXT_MAX_CHUNKS=120
 DSPY_LM_KWARGS={"temperature":0.2}
 DSPY_SUBAGENT_LM_KWARGS={"temperature":0.0}
 DSPY_RLM_INTERPRETER=true
@@ -110,6 +119,11 @@ uv run python3 -m pytest -q
 - Signature input mismatch:
   - use `DSPY_RLM_SIGNATURE` with `context, query` (and optional guidance-like field names).
 - Prompt templates:
+  - simple default workflow: use `prompt-config/config.md` sections (`# Question`, `# Scope`, `# System`, `# Custom Prompt`, `# Signature`, `# Output Template`).
+  - `prompt-config/README.md` includes starter guidance and a single sample file.
+  - set `DSPY_PROMPT_CONFIG_DIR` to use another folder path.
+  - `prompts.md` is optional and disabled by default (`DSPY_USE_PROMPTS_FILE=false`).
+  - if you enable `prompts.md`, the existing template behavior still applies.
   - `{{variable}}` placeholders are supported in prompt sections.
   - missing template variables are prompted interactively at runtime.
   - `output_mode` and `output_template` are injected automatically so you can switch between research and concise outputs.
@@ -119,6 +133,15 @@ uv run python3 -m pytest -q
   - keep `DSPY_CITATION_REPAIR_DIRECT_MODE=false` to preserve subagent calls during citation repair retries.
 - OpenRouter context overflow:
   - with `DSPY_OPENROUTER_AUTO_MIDDLE_OUT=true`, one automatic retry is attempted using OpenRouter `middle-out` transform when max-context errors are detected.
+  - query-focused context selection is enabled by default; tune with `DSPY_CONTEXT_MAX_CHARS`, `DSPY_CONTEXT_CHUNK_CHARS`, and `DSPY_CONTEXT_MAX_CHUNKS`.
+- Live progress logs:
+  - set `DSPY_LIVE_LM_LOGS=true` to print ongoing root/sub LM call start/finish logs during a run.
+  - set `DSPY_RLM_VERBOSE=true` to include DSPy RLM iteration/code logs.
+- Provider compatibility:
+  - DSPy may fallback to JSONAdapter (`response_format=json_object`) when chat parsing fails.
+  - some provider endpoints (e.g. OpenRouter StepFun routes) reject `json_object`.
+  - this app auto-disables JSONAdapter fallback for known incompatible models (currently StepFun model IDs).
+  - you can still override manually with `DSPY_DISABLE_JSON_ADAPTER_FALLBACK=true|false`.
 - Research fallback mode:
   - `DSPY_RESEARCH_ALLOW_DIRECT_FALLBACK=true` allows automatic direct retry on recursive timeout/stall.
   - set it to `false` if you want research mode to stay recursive/subagent-only.

@@ -27,6 +27,126 @@ def _read_env(*names: str) -> str:
     return ""
 
 
+if dspy is not None:
+    class _TracingLMProxy(dspy.BaseLM):
+        def __init__(self, lm: Any, label: str):
+            # Initialize BaseLM so DSPy internals that type/attribute-check BaseLM
+            # can safely consume this proxy instance.
+            super().__init__(
+                model=getattr(lm, "model", "unknown"),
+                model_type=getattr(lm, "model_type", "chat"),
+                temperature=getattr(lm, "temperature", 0.0),
+                max_tokens=getattr(lm, "max_tokens", 1000),
+                cache=getattr(lm, "cache", True),
+            )
+            self._lm = lm
+            self._label = label
+            if hasattr(lm, "history"):
+                self.history = getattr(lm, "history")
+            if hasattr(lm, "kwargs"):
+                self.kwargs = dict(getattr(lm, "kwargs") or {})
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._lm, name)
+
+        @staticmethod
+        def _usage_from_entry(entry: dict) -> tuple[int, int]:
+            usage = entry.get("usage") or {}
+            if not isinstance(usage, dict):
+                return 0, 0
+            input_tokens = (
+                usage.get("input_tokens")
+                or usage.get("prompt_tokens")
+                or usage.get("total_input_tokens")
+                or usage.get("prompt_token_count")
+                or 0
+            )
+            output_tokens = (
+                usage.get("output_tokens")
+                or usage.get("completion_tokens")
+                or usage.get("total_output_tokens")
+                or usage.get("candidates_token_count")
+                or 0
+            )
+            try:
+                return int(input_tokens), int(output_tokens)
+            except Exception:
+                return 0, 0
+
+        def _log_end(self, start_hist: int, start_time: float) -> None:
+            elapsed = time.perf_counter() - start_time
+            new_entries = list((getattr(self._lm, "history", []) or [])[start_hist:])
+            in_tokens = 0
+            out_tokens = 0
+            for entry in new_entries:
+                in_t, out_t = self._usage_from_entry(entry)
+                in_tokens += in_t
+                out_tokens += out_t
+            print(
+                f"[{self._label}] call finished in {elapsed:.1f}s"
+                f" (calls={len(new_entries)}, in={in_tokens}, out={out_tokens})",
+                flush=True,
+            )
+
+        def __call__(self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs):
+            start_hist = len(getattr(self._lm, "history", []) or [])
+            start_time = time.perf_counter()
+            print(f"[{self._label}] call started", flush=True)
+            if messages is not None and prompt is None:
+                result = self._lm(messages=messages, **kwargs)
+            elif prompt is not None and messages is None:
+                result = self._lm(prompt=prompt, **kwargs)
+            else:
+                result = self._lm(prompt=prompt, messages=messages, **kwargs)
+            self._log_end(start_hist, start_time)
+            return result
+
+        async def acall(self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs):
+            start_hist = len(getattr(self._lm, "history", []) or [])
+            start_time = time.perf_counter()
+            print(f"[{self._label}] call started", flush=True)
+            if hasattr(self._lm, "acall"):
+                if messages is not None and prompt is None:
+                    result = await self._lm.acall(messages=messages, **kwargs)
+                elif prompt is not None and messages is None:
+                    result = await self._lm.acall(prompt=prompt, **kwargs)
+                else:
+                    result = await self._lm.acall(prompt=prompt, messages=messages, **kwargs)
+            else:
+                result = self.__call__(prompt=prompt, messages=messages, **kwargs)
+            self._log_end(start_hist, start_time)
+            return result
+
+        def forward(self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs):
+            if hasattr(self._lm, "forward"):
+                if messages is not None and prompt is None:
+                    return self._lm.forward(messages=messages, **kwargs)
+                if prompt is not None and messages is None:
+                    return self._lm.forward(prompt=prompt, **kwargs)
+                return self._lm.forward(prompt=prompt, messages=messages, **kwargs)
+            return self.__call__(prompt=prompt, messages=messages, **kwargs)
+
+        async def aforward(self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs):
+            if hasattr(self._lm, "aforward"):
+                if messages is not None and prompt is None:
+                    return await self._lm.aforward(messages=messages, **kwargs)
+                if prompt is not None and messages is None:
+                    return await self._lm.aforward(prompt=prompt, **kwargs)
+                return await self._lm.aforward(prompt=prompt, messages=messages, **kwargs)
+            return await self.acall(prompt=prompt, messages=messages, **kwargs)
+else:
+    class _TracingLMProxy:  # pragma: no cover
+        def __init__(self, lm: Any, label: str):
+            self._lm = lm
+            self._label = label
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._lm, name)
+
+        def __call__(self, *args, **kwargs):
+            return self._lm(*args, **kwargs)
+
+
 class DSPyRLMHandler:
     def __init__(
         self,
@@ -459,6 +579,9 @@ class DSPyRLMHandler:
         rlm_interpreter: Any = None,
         require_subagent_call: bool = False,
         subagent_prefetch_calls: int = 0,
+        trace_lm_calls: bool = False,
+        disable_json_adapter_fallback: bool = False,
+        force_subagent_bootstrap: bool = False,
     ) -> str:
         if max_iterations is not None and max_iterations <= 0:
             raise ValueError("max_iterations must be greater than 0 when provided.")
@@ -492,6 +615,12 @@ class DSPyRLMHandler:
             return f"Error querying DSPy: {error}"
 
         try:
+            root_runtime_lm = (
+                _TracingLMProxy(root_lm, f"root:{getattr(root_lm, 'model', 'unknown')}")
+                if trace_lm_calls
+                else root_lm
+            )
+
             if not use_subagents:
                 payload = self._compose_single_pass_prompt(prompt, context)
                 messages = [{"role": "user", "content": payload}]
@@ -501,7 +630,7 @@ class DSPyRLMHandler:
 
                 start_hist = len(getattr(root_lm, "history", []) or [])
                 start_time = time.perf_counter()
-                completion_output = root_lm(messages=messages)
+                completion_output = root_runtime_lm(messages=messages)
                 end_time = time.perf_counter()
 
                 response_text = self._extract_lm_text(completion_output)
@@ -523,21 +652,57 @@ class DSPyRLMHandler:
                 return response_text
 
             sub_lm = None
-            if subagent_backend and subagent_model:
+            if use_subagents:
+                # Always bind llm_query/llm_query_batched to an explicit sub_lm.
+                # If no dedicated subagent config is provided, mirror root backend/model
+                # with a separate LM instance so routing is deterministic.
+                effective_sub_backend = subagent_backend or self.backend
+                effective_sub_model = subagent_model or model or getattr(root_lm, "model", None)
+                effective_sub_lm_kwargs = subagent_lm_kwargs
+                effective_sub_api_key: Optional[str] = None
+
+                if subagent_backend is None and subagent_model is None:
+                    effective_sub_api_key = self.api_key
+                    if effective_sub_lm_kwargs is None:
+                        effective_sub_lm_kwargs = root_lm_kwargs
+
                 sub_lm = self._build_lm(
-                    backend=subagent_backend,
-                    model=subagent_model,
-                    explicit_api_key=None,
-                    lm_kwargs=subagent_lm_kwargs,
+                    backend=effective_sub_backend,
+                    model=effective_sub_model,
+                    explicit_api_key=effective_sub_api_key,
+                    lm_kwargs=effective_sub_lm_kwargs,
                 )
 
+            sub_runtime_lm = (
+                _TracingLMProxy(sub_lm, f"sub:{getattr(sub_lm, 'model', 'unknown')}")
+                if trace_lm_calls and sub_lm is not None
+                else sub_lm
+            )
             configured_subagent_model = (
                 getattr(sub_lm, "model", subagent_model) if sub_lm else None
             )
             sub_start_hist = len(getattr(sub_lm, "history", []) or []) if sub_lm else 0
 
             prefetch_blocks: list[str] = []
-            if sub_lm and subagent_prefetch_calls > 0:
+            if sub_runtime_lm and force_subagent_bootstrap:
+                bootstrap_context = context[:12000]
+                bootstrap_messages = [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Subagent bootstrap task. Extract 3-5 highest-signal evidence bullets "
+                            "for this question. Keep it brief and include citations if available.\n\n"
+                            f"Question:\n{prompt}\n\nContext snippet:\n{bootstrap_context}"
+                        ),
+                    }
+                ]
+                bootstrap_output = sub_runtime_lm(messages=bootstrap_messages)
+                bootstrap_text = self._extract_lm_text(bootstrap_output)
+                if bootstrap_text:
+                    prefetch_blocks.append(
+                        "Bootstrap evidence memo:\n" + bootstrap_text.strip()
+                    )
+            if sub_runtime_lm and subagent_prefetch_calls > 0:
                 prefetch_messages = [
                     {
                         "role": "user",
@@ -550,7 +715,7 @@ class DSPyRLMHandler:
                     }
                 ]
                 for _ in range(subagent_prefetch_calls):
-                    prefetch_output = sub_lm(messages=prefetch_messages)
+                    prefetch_output = sub_runtime_lm(messages=prefetch_messages)
                     prefetch_text = self._extract_lm_text(prefetch_output)
                     if prefetch_text:
                         prefetch_blocks.append(prefetch_text.strip())
@@ -579,7 +744,13 @@ class DSPyRLMHandler:
 
             root_start_hist = len(getattr(root_lm, "history", []) or [])
             start_time = time.perf_counter()
-            with dspy.context(lm=root_lm):
+            adapter = None
+            if disable_json_adapter_fallback and hasattr(dspy, "ChatAdapter"):
+                adapter = dspy.ChatAdapter(use_json_adapter_fallback=False)
+            context_kwargs = {"lm": root_runtime_lm}
+            if adapter is not None:
+                context_kwargs["adapter"] = adapter
+            with dspy.context(**context_kwargs):
                 agent = dspy.RLM(
                     signature=signature_obj,
                     max_iterations=max_iterations or 20,
@@ -587,7 +758,7 @@ class DSPyRLMHandler:
                     max_output_chars=max_output_chars or 10000,
                     verbose=self.verbose,
                     tools=rlm_tools,
-                    sub_lm=sub_lm,
+                    sub_lm=sub_runtime_lm,
                     interpreter=rlm_interpreter,
                 )
                 result = agent(**call_inputs)

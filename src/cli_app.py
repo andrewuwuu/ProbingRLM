@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from src.cli_config import (
     _load_tools_from_env,
     _parse_bool_env,
+    _parse_non_negative_int_env,
     _parse_json_object_env,
     _parse_positive_float_env,
     _parse_positive_int_env,
@@ -29,7 +30,7 @@ from src.cli_metrics import (
 from src.cli_prompting import (
     _build_runtime_prompt_vars,
     _get_prompt_section,
-    _normalize_output_mode,
+    _normalize_output_mode as _normalize_output_mode_impl,
     _output_template_for_mode,
     _prompt_output_mode,
     _render_prompt_section,
@@ -38,6 +39,7 @@ from src.cli_prompting import (
     default_prompt_query as _default_prompt_query_impl,
     default_should_continue_session,
 )
+from src.context_selector import build_query_context
 from src.output_utils import save_markdown_response, save_pdf_response
 from src.pdf_utils import list_documents, load_document
 from src.prompt_loader import load_prompts, parse_prompt_variables
@@ -45,11 +47,122 @@ from src.rlm_handler import RLMHandler
 
 DOCUMENT_DIR = "embed-docs"
 PROMPTS_FILE = "prompts.md"
+PROMPT_CONFIG_DIR = "prompt-config"
+PROMPT_CONFIG_BUNDLE_FILES = ("config.md", "defaults.md")
 RESPONSE_DIR = "response"
+DEFAULT_SCOPE = "Use only what is explicitly stated in the documents."
+QUERY_PLACEHOLDER_VALUES = {
+    "provide your research question here.",
+    "your research question here.",
+}
 FORCE_SUBAGENT_QUERY_INSTRUCTION = (
     "Subagent requirement: you must call llm_query(...) or llm_query_batched(...) at least "
     "once before SUBMIT(...). If no subagent call is made, the answer is invalid."
 )
+PROMPT_CONFIG_FILE_MAP = {
+    "question": "question.md",
+    "scope": "scope.md",
+    "system_prompt": "system.md",
+    "custom_prompt": "custom.md",
+    "rlm_signature": "signature.txt",
+    "output_template": "output_template.md",
+}
+PROMPT_CONFIG_SECTION_MAP = {
+    "question": ("Question", "Query"),
+    "scope": ("Scope", "Scope and constraints", "Constraints"),
+    "system_prompt": ("System", "System Prompt"),
+    "custom_prompt": ("Custom Prompt", "Custom"),
+    "rlm_signature": ("RLM Signature", "Signature"),
+    "output_template": ("Output Template", "Template"),
+}
+
+
+def _default_scope_for_mode(output_mode: str) -> str:
+    if output_mode == "research":
+        return (
+            f"{DEFAULT_SCOPE} Explicitly separate direct evidence from inference, "
+            "and list missing evidence per unsupported claim."
+        )
+    return DEFAULT_SCOPE
+
+
+def _build_builtin_system_prompt(output_mode: str) -> str:
+    base = (
+        "You are a document analyst. Answer only from provided context. "
+        "Do not hallucinate facts not present in context. "
+        "Every material claim must include citation [source: <filename>, page: <N or n/a>]."
+    )
+    if output_mode == "research":
+        return (
+            base
+            + " Produce full research-ready output with explicit thesis, evidence map, "
+            "analysis, theoretical lens, gaps/limits, and confidence."
+        )
+    return (
+        base
+        + " Produce concise output with direct answer, key evidence, missing evidence, "
+        "and confidence."
+    )
+
+
+def _build_query_payload(
+    question: str,
+    scope: str,
+    output_mode: str,
+    output_template: str,
+) -> str:
+    return (
+        "Research question:\n"
+        f"{question.strip()}\n\n"
+        "Scope and constraints:\n"
+        f"{scope.strip()}\n\n"
+        f"Requested output mode: {output_mode}\n\n"
+        "Required output structure:\n"
+        f"{output_template}\n\n"
+        "Citation format reminder:\n"
+        '- "<short quote>" [source: <filename>, page: <N or n/a>]'
+    )
+
+
+def _model_requires_no_json_fallback(model_name: str | None) -> bool:
+    lowered = (model_name or "").lower()
+    # OpenRouter StepFun endpoints currently reject response_format=json_object.
+    return "/stepfun/" in lowered
+
+
+def _load_prompt_config_from_dir(config_dir: str) -> dict[str, str]:
+    config: dict[str, str] = {}
+    if not config_dir or not os.path.isdir(config_dir):
+        return config
+
+    # Preferred mode: one bundled markdown file with section headers.
+    for bundle_name in PROMPT_CONFIG_BUNDLE_FILES:
+        bundle_path = os.path.join(config_dir, bundle_name)
+        if not os.path.isfile(bundle_path):
+            continue
+        sections = load_prompts(bundle_path)
+        if not sections:
+            continue
+        for key, section_names in PROMPT_CONFIG_SECTION_MAP.items():
+            for section_name in section_names:
+                value = _get_prompt_section(sections, section_name)
+                if value and value.strip():
+                    config[key] = value.strip()
+                    break
+
+    # Backward compatibility: per-file overrides if present.
+    for key, filename in PROMPT_CONFIG_FILE_MAP.items():
+        file_path = os.path.join(config_dir, filename)
+        if not os.path.isfile(file_path):
+            continue
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+        except Exception:
+            continue
+        if value:
+            config[key] = value
+    return config
 
 
 def default_prompt_yes_no(message: str, default: bool = False) -> bool:
@@ -64,6 +177,10 @@ def _resolve_default_output_mode(prompt_vars: dict[str, str]) -> str:
         prompt_vars=prompt_vars,
         env_output_mode=_read_env("DSPY_OUTPUT_MODE"),
     )
+
+
+def _normalize_output_mode(value: str | None) -> str:
+    return _normalize_output_mode_impl(value)
 
 
 def default_prompt_query(
@@ -114,6 +231,7 @@ def _run_query_with_live_status(
     handler: RLMHandler,
     query_kwargs: dict,
     timeout_seconds: float | None = None,
+    live_logs: bool = False,
 ) -> str:
     result: dict[str, dict | str] = {}
     timed_out = False
@@ -135,6 +253,7 @@ def _run_query_with_live_status(
     spinner = ["|", "/", "-", "\\"]
     start_time = time.perf_counter()
     spinner_index = 0
+    poll_interval = 0.5 if live_logs else 0.2
 
     process.start()
     try:
@@ -145,7 +264,7 @@ def _run_query_with_live_status(
                 break
 
             try:
-                result = out_queue.get(timeout=0.2)
+                result = out_queue.get(timeout=poll_interval)
                 break
             except queue.Empty:
                 pass
@@ -160,13 +279,14 @@ def _run_query_with_live_status(
                         pass
                 break
 
-            elapsed = time.perf_counter() - start_time
-            print(
-                f"\rProcessing {spinner[spinner_index % len(spinner)]}  elapsed: {elapsed:5.1f}s",
-                end="",
-                flush=True,
-            )
-            spinner_index += 1
+            if not live_logs:
+                elapsed = time.perf_counter() - start_time
+                print(
+                    f"\rProcessing {spinner[spinner_index % len(spinner)]}  elapsed: {elapsed:5.1f}s",
+                    end="",
+                    flush=True,
+                )
+                spinner_index += 1
     except KeyboardInterrupt:
         print("\nCancelling query...")
         if process.is_alive():
@@ -219,7 +339,10 @@ def _run_query_with_live_status(
             pass
 
     elapsed = time.perf_counter() - start_time
-    print(f"\rProcessing complete. elapsed: {elapsed:5.1f}s{' ' * 12}")
+    if live_logs:
+        print(f"Processing complete. elapsed: {elapsed:5.1f}s")
+    else:
+        print(f"\rProcessing complete. elapsed: {elapsed:5.1f}s{' ' * 12}")
 
     if process.exitcode != 0:
         handler.last_metrics = {"error": f"worker_exit_code_{process.exitcode}"}
@@ -295,7 +418,7 @@ def main(
     max_llm_calls = _parse_positive_int_env("DSPY_RLM_MAX_LLM_CALLS")
     max_output_chars = _parse_positive_int_env("DSPY_RLM_MAX_OUTPUT_CHARS")
     max_depth = _parse_positive_int_env("DSPY_RLM_MAX_DEPTH")
-    subagent_prefetch_calls = _parse_positive_int_env("DSPY_SUBAGENT_PREFETCH_CALLS") or 0
+    subagent_prefetch_calls = _parse_non_negative_int_env("DSPY_SUBAGENT_PREFETCH_CALLS") or 0
     rlm_signature = _read_env("DSPY_RLM_SIGNATURE") or None
     custom_prompt = (os.getenv("DSPY_CUSTOM_PROMPT") or "").strip() or None
     query_timeout_seconds = _parse_positive_float_env("DSPY_QUERY_TIMEOUT_SECONDS")
@@ -317,11 +440,25 @@ def main(
     openrouter_auto_middle_out = _parse_bool_env("DSPY_OPENROUTER_AUTO_MIDDLE_OUT")
     if openrouter_auto_middle_out is None:
         openrouter_auto_middle_out = True
+    use_prompts_file = _parse_bool_env("DSPY_USE_PROMPTS_FILE")
+    if use_prompts_file is None:
+        use_prompts_file = False
+    prompt_config_dir = (os.getenv("DSPY_PROMPT_CONFIG_DIR") or PROMPT_CONFIG_DIR).strip()
+    context_max_chars = _parse_positive_int_env("DSPY_CONTEXT_MAX_CHARS")
+    context_chunk_chars = _parse_positive_int_env("DSPY_CONTEXT_CHUNK_CHARS") or 2200
+    context_max_chunks = _parse_positive_int_env("DSPY_CONTEXT_MAX_CHUNKS") or 120
 
     root_lm_kwargs = _parse_json_object_env("DSPY_LM_KWARGS")
     subagent_lm_kwargs = _parse_json_object_env("DSPY_SUBAGENT_LM_KWARGS")
     rlm_interpreter = _parse_bool_env("DSPY_RLM_INTERPRETER")
     rlm_tools = _load_tools_from_env("DSPY_RLM_TOOLS")
+    rlm_verbose = bool(_parse_bool_env("DSPY_RLM_VERBOSE"))
+    live_lm_logs = bool(_parse_bool_env("DSPY_LIVE_LM_LOGS"))
+    disable_json_adapter_fallback = _parse_bool_env("DSPY_DISABLE_JSON_ADAPTER_FALLBACK")
+    if disable_json_adapter_fallback is None:
+        disable_json_adapter_fallback = _model_requires_no_json_fallback(model_name)
+    if disable_json_adapter_fallback:
+        print("JSON adapter fallback disabled for provider/model compatibility.")
 
     use_subagents = prompt_yes_no("Use DSPy RLM subagents? (y/N): ", default=False)
     subagent_backend: str | None = None
@@ -333,9 +470,9 @@ def main(
             root_model=model_name,
             prompt_yes_no=prompt_yes_no,
         )
-    if require_subagent_call and not (subagent_backend and subagent_model):
+    if require_subagent_call and not use_subagents:
         print(
-            "Warning: strict subagent-call checks require a dedicated subagent backend/model. "
+            "Warning: strict subagent-call checks require subagents to be enabled. "
             "Disabling strict subagent-call requirement for this run."
         )
         require_subagent_call = False
@@ -343,6 +480,7 @@ def main(
     selected_pdf_docs = {doc.lower() for doc in selected_docs if doc.lower().endswith(".pdf")}
 
     combined_sections: list[str] = []
+    loaded_documents: list[tuple[str, str]] = []
     failed_docs: list[str] = []
     for selected_doc in selected_docs:
         doc_path = os.path.join(DOCUMENT_DIR, selected_doc)
@@ -351,6 +489,7 @@ def main(
         if not doc_text:
             failed_docs.append(selected_doc)
             continue
+        loaded_documents.append((selected_doc, doc_text))
         combined_sections.append(
             f"===== BEGIN FILE: {selected_doc} =====\n{doc_text}\n===== END FILE: {selected_doc} ====="
         )
@@ -373,9 +512,17 @@ def main(
     prompt_vars: dict[str, str] = {}
     file_custom_prompt_template: str | None = None
     file_rlm_signature_template: str | None = None
-    if os.path.exists(PROMPTS_FILE) and prompt_yes_no(
-        f"\nLoad prompts from {PROMPTS_FILE}? (y/N): ", default=False
-    ):
+    prompt_config = _load_prompt_config_from_dir(prompt_config_dir)
+    if prompt_config:
+        for key in ("question", "scope", "output_template"):
+            if prompt_config.get(key) and not prompt_vars.get(key):
+                prompt_vars[key] = prompt_config[key]
+        print(
+            f"Loaded prompt-config defaults from '{prompt_config_dir}/' "
+            f"({', '.join(sorted(prompt_config.keys()))})."
+        )
+    use_prompt_templates = bool(use_prompts_file and os.path.exists(PROMPTS_FILE))
+    if use_prompt_templates:
         prompts_cache = load_prompts(PROMPTS_FILE)
         variables_section = _get_prompt_section(prompts_cache, "Variables")
         file_custom_prompt_template = (
@@ -387,20 +534,18 @@ def main(
             or _get_prompt_section(prompts_cache, "Signature")
         )
         prompt_vars.update(parse_prompt_variables(variables_section))
-        print(f"Loaded prompts from {PROMPTS_FILE}.")
+        print(f"Loaded prompts from {PROMPTS_FILE} (DSPY_USE_PROMPTS_FILE=true).")
 
     allow_follow_ups = prompt_yes_no(
         "\nAllow follow-up queries in this run? (Y/n): ",
         default=True,
     )
     selected_output_mode = _prompt_output_mode(_resolve_default_output_mode(prompt_vars))
-    output_template = prompt_vars.get("output_template") or _output_template_for_mode(
-        selected_output_mode
-    )
+    output_template = prompt_vars.get("output_template") or _output_template_for_mode(selected_output_mode)
     prompt_vars["output_mode"] = selected_output_mode
     prompt_vars["output_template"] = output_template
 
-    handler = RLMHandler(backend=backend, api_key=api_key, verbose=False)
+    handler = RLMHandler(backend=backend, api_key=api_key, verbose=rlm_verbose)
 
     answered_queries = 0
     while True:
@@ -417,43 +562,150 @@ def main(
             output_mode=selected_output_mode,
             output_template=output_template,
         )
-        default_query_template = _get_prompt_section(prompts_cache, "Query")
-        default_query = _render_prompt_section(
-            section_text=default_query_template,
-            section_name="Query",
-            runtime_vars=runtime_prompt_vars,
-            prompt_vars=prompt_vars,
-        )
-        query = prompt_query(default_query, prompt_yes_no)
+        if use_prompt_templates:
+            default_query_template = _get_prompt_section(prompts_cache, "Query")
+            use_structured_query_prompt = bool(
+                default_query_template and "{{question}}" in default_query_template
+            )
+            if use_structured_query_prompt:
+                default_question = (prompt_vars.get("question") or "").strip()
+                if default_question.lower() in QUERY_PLACEHOLDER_VALUES:
+                    default_question = ""
+                question_prompt = (
+                    "\nEnter research question (or 'q' to quit): "
+                    if selected_output_mode == "research"
+                    else "\nEnter question (or 'q' to quit): "
+                )
+                question_value = input(question_prompt).strip()
+                if question_value.lower() == "q":
+                    break
+                if not question_value:
+                    question_value = default_question
+                if not question_value:
+                    print("Question is required.")
+                    continue
+                prompt_vars["question"] = question_value
+
+                if "{{scope}}" in default_query_template:
+                    default_scope = (
+                        (prompt_vars.get("scope") or "").strip()
+                        or _default_scope_for_mode(selected_output_mode)
+                    )
+                    scope_value = input(
+                        f"Enter scope/constraints [default: {default_scope}]: "
+                    ).strip()
+                    prompt_vars["scope"] = scope_value or default_scope
+
+                query = _render_prompt_section(
+                    section_text=default_query_template,
+                    section_name="Query",
+                    runtime_vars=runtime_prompt_vars,
+                    prompt_vars=prompt_vars,
+                ) or ""
+            else:
+                default_query = _render_prompt_section(
+                    section_text=default_query_template,
+                    section_name="Query",
+                    runtime_vars=runtime_prompt_vars,
+                    prompt_vars=prompt_vars,
+                )
+                query = prompt_query(default_query, prompt_yes_no)
+        else:
+            question_prompt = (
+                "\nEnter research question (or 'q' to quit): "
+                if selected_output_mode == "research"
+                else "\nEnter question (or 'q' to quit): "
+            )
+            default_question = (prompt_vars.get("question") or "").strip()
+            if default_question.lower() in QUERY_PLACEHOLDER_VALUES:
+                default_question = ""
+            question_value = input(question_prompt).strip()
+            if question_value.lower() == "q":
+                break
+            if not question_value:
+                question_value = default_question
+            if not question_value:
+                print("Question is required.")
+                continue
+            default_scope = (prompt_vars.get("scope") or "").strip() or _default_scope_for_mode(
+                selected_output_mode
+            )
+            scope_value = input(
+                f"Enter scope/constraints [default: {default_scope}]: "
+            ).strip()
+            scope_value = scope_value or default_scope
+            prompt_vars["question"] = question_value
+            prompt_vars["scope"] = scope_value
+            query = _build_query_payload(
+                question=question_value,
+                scope=scope_value,
+                output_mode=selected_output_mode,
+                output_template=output_template,
+            )
+
         if query.lower() == "q":
             break
 
+        retrieval_query = (prompt_vars.get("question") or "").strip() or query
+        context_budget_chars = context_max_chars or (
+            260000 if selected_output_mode == "research" else 160000
+        )
+        query_context_text, context_stats = build_query_context(
+            documents=loaded_documents,
+            query=retrieval_query,
+            max_chars=context_budget_chars,
+            chunk_chars=context_chunk_chars,
+            max_chunks=context_max_chunks,
+        )
+        context_kind = "truncated" if context_stats.get("truncated") else "full"
+        print(
+            "Context prepared: "
+            f"{context_stats.get('selected_chars', 0)} chars, "
+            f"{context_stats.get('selected_chunks', 0)}/{context_stats.get('available_chunks', 0)} chunks "
+            f"({context_kind}, budget={context_budget_chars})."
+        )
+
         runtime_prompt_vars["query"] = query
-        system_prompt = _render_prompt_section(
-            section_text=_get_prompt_section(prompts_cache, "System"),
-            section_name="System",
-            runtime_vars=runtime_prompt_vars,
-            prompt_vars=prompt_vars,
-        )
-        effective_custom_prompt = custom_prompt or _render_prompt_section(
-            section_text=file_custom_prompt_template,
-            section_name="Custom Prompt",
-            runtime_vars=runtime_prompt_vars,
-            prompt_vars=prompt_vars,
-        )
-        effective_rlm_signature = rlm_signature or _render_prompt_section(
-            section_text=file_rlm_signature_template,
-            section_name="RLM Signature",
-            runtime_vars=runtime_prompt_vars,
-            prompt_vars=prompt_vars,
-        )
+        if use_prompt_templates:
+            system_prompt = _render_prompt_section(
+                section_text=_get_prompt_section(prompts_cache, "System"),
+                section_name="System",
+                runtime_vars=runtime_prompt_vars,
+                prompt_vars=prompt_vars,
+            )
+            template_custom_prompt = _render_prompt_section(
+                section_text=file_custom_prompt_template,
+                section_name="Custom Prompt",
+                runtime_vars=runtime_prompt_vars,
+                prompt_vars=prompt_vars,
+            )
+            template_signature = _render_prompt_section(
+                section_text=file_rlm_signature_template,
+                section_name="RLM Signature",
+                runtime_vars=runtime_prompt_vars,
+                prompt_vars=prompt_vars,
+            )
+        else:
+            system_prompt = prompt_config.get("system_prompt") or _build_builtin_system_prompt(
+                selected_output_mode
+            )
+            template_custom_prompt = prompt_config.get("custom_prompt")
+            template_signature = prompt_config.get("rlm_signature") or "context, query -> answer"
+        effective_custom_prompt = custom_prompt or template_custom_prompt
+        effective_rlm_signature = rlm_signature or template_signature
 
         print("\nProcessing...")
 
         retry_attempted = False
+        parse_format_retry_attempted = False
         middle_out_retry_attempted = False
         middle_out_primary_metrics: dict | None = None
         retry_suffix = FORCE_SUBAGENT_QUERY_INSTRUCTION
+        parse_retry_suffix = (
+            "RLM format requirement: every planner step must output both fields "
+            "`reasoning` and `code`. The `code` field must contain executable Python. "
+            "When finished, return final answer via SUBMIT(...)."
+        )
         response = ""
         run_custom_prompt = effective_custom_prompt
         run_root_lm_kwargs = dict(root_lm_kwargs) if root_lm_kwargs else None
@@ -462,7 +714,7 @@ def main(
         while True:
             query_kwargs = dict(
                 prompt=query,
-                context=document_text,
+                context=query_context_text,
                 model=model_name,
                 use_subagents=use_subagents,
                 system_prompt=system_prompt,
@@ -480,17 +732,32 @@ def main(
                 rlm_tools=rlm_tools,
                 rlm_interpreter=rlm_interpreter,
                 require_subagent_call=require_subagent_call,
-                subagent_prefetch_calls=(
-                    subagent_prefetch_calls
-                    if use_subagents and subagent_backend and subagent_model
-                    else 0
-                ),
+                subagent_prefetch_calls=subagent_prefetch_calls if use_subagents else 0,
+                trace_lm_calls=live_lm_logs,
+                disable_json_adapter_fallback=disable_json_adapter_fallback,
             )
             response = _run_query_with_live_status(
                 handler,
                 query_kwargs,
                 timeout_seconds=query_timeout_seconds,
+                live_logs=live_lm_logs,
             )
+
+            has_parse_format_error = (
+                "Adapter ChatAdapter failed to parse the LM response" in response
+                and "Expected to find output fields in the LM response: [reasoning, code]"
+                in response
+            )
+            if has_parse_format_error and not parse_format_retry_attempted:
+                parse_format_retry_attempted = True
+                print(
+                    "Planner format parse failed. Retrying once with strict reasoning/code format instruction."
+                )
+                if run_custom_prompt:
+                    run_custom_prompt = f"{run_custom_prompt}\n\n{parse_retry_suffix}"
+                else:
+                    run_custom_prompt = parse_retry_suffix
+                continue
 
             if not (
                 require_subagent_call
@@ -543,6 +810,7 @@ def main(
                     subagent_lm_kwargs=run_subagent_lm_kwargs,
                 ),
                 timeout_seconds=query_timeout_seconds,
+                live_logs=live_lm_logs,
             )
 
         if middle_out_primary_metrics is not None:
@@ -576,6 +844,7 @@ def main(
                 handler,
                 direct_kwargs,
                 timeout_seconds=query_timeout_seconds,
+                live_logs=live_lm_logs,
             )
             handler.last_metrics = _merge_run_metrics_with_fallback(
                 primary=primary_metrics,
@@ -613,6 +882,7 @@ def main(
                 handler,
                 citation_retry_kwargs,
                 timeout_seconds=query_timeout_seconds,
+                live_logs=live_lm_logs,
             )
             handler.last_metrics = _merge_run_metrics_with_retry(
                 primary=citation_primary_metrics,

@@ -1,6 +1,6 @@
 # Variables
 Fill defaults here. Any missing {{variable}} will be prompted interactively.
-question=
+question=Provide your research question here.
 scope=Use only what is explicitly stated in the documents.
 audience=technical_research
 output_mode=research
@@ -14,11 +14,13 @@ and PDF page markers like:
 
 Rules:
 1. Answer only from provided context.
-2. No hallucinations. If evidence is missing, say exactly:
+2. No hallucinations. If evidence is missing for a specific claim, explicitly mark that claim as:
    Not found in provided document context
+   Then continue with the strongest partial analysis from available evidence.
 3. Prefer direct quotes over paraphrase for key claims.
 4. Every material claim must include a citation with file and page when available.
 5. If context is long, prioritize the most relevant high-signal evidence first.
+6. Separate what is directly evidenced from what is interpretive inference.
 
 Citation format requirements:
 - Use inline citations in this format: [source: <filename>, page: <N>]
@@ -40,6 +42,8 @@ When output_mode=research:
 - Provide a full research-ready response with explicit evidence reasoning.
 - Include uncertainty, conflicts, and missing evidence sections when relevant.
 - Keep claims traceable to quotes/citations.
+- Target depth: ~700-1200 words unless the question is intrinsically narrow.
+- If evidence is sparse, do not collapse to a one-liner: produce a structured partial answer, a gap map, and a concrete next-evidence checklist.
 
 # Query
 Research question:
