@@ -5,7 +5,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-# Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src import pdf_utils
@@ -198,6 +197,42 @@ class TestPDFRetrieval(unittest.TestCase):
         self.assertEqual(logger.subagent_calls, 1)
         with self.assertRaises(RuntimeError):
             logger.log(iter_two)
+
+    def test_inmemory_logger_clear_iterations_and_trajectory(self):
+        logger = rlm_handler._InMemoryRLMLogger()
+        metadata = SimpleNamespace(to_dict=lambda: {"root_model": "openai/gpt-5-mini"})
+        iteration = SimpleNamespace(
+            to_dict=lambda: {"response": "ok", "code_blocks": []},
+            code_blocks=[],
+        )
+
+        logger.log_metadata(metadata)
+        logger.log(iteration)
+
+        trajectory = logger.get_trajectory()
+        self.assertIsNotNone(trajectory)
+        self.assertEqual(trajectory["run_metadata"]["root_model"], "openai/gpt-5-mini")
+        self.assertEqual(len(trajectory["iterations"]), 1)
+        self.assertEqual(logger.iteration_count, 1)
+
+        logger.clear_iterations()
+        self.assertEqual(logger.iteration_count, 0)
+        self.assertEqual(logger.get_trajectory()["run_metadata"]["root_model"], "openai/gpt-5-mini")
+        self.assertEqual(logger.get_trajectory()["iterations"], [])
+
+    def test_guarded_logger_clear_iterations_resets_subagent_calls(self):
+        logger = rlm_handler._GuardedRLMLogger(max_subagent_calls=5)
+        iteration = SimpleNamespace(
+            code_blocks=[SimpleNamespace(result=SimpleNamespace(rlm_calls=["call-1", "call-2"]))]
+        )
+
+        logger.log(iteration)
+        self.assertEqual(logger.subagent_calls, 2)
+        self.assertEqual(logger.iteration_count, 1)
+
+        logger.clear_iterations()
+        self.assertEqual(logger.subagent_calls, 0)
+        self.assertEqual(logger.iteration_count, 0)
 
     @patch("src.rlm_handler.rlm.RLM")
     def test_rlm_query_reports_subagent_call_guard_violation(self, mock_rlm_class):

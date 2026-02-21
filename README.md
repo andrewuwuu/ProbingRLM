@@ -1,13 +1,13 @@
 # ProbingRLM
 
-`ProbingRLM` is a terminal-based document question-answering tool built on the `rlms` library.
+`ProbingRLM` is a local document question-answering tool built on the `rlms` library.
 It loads local documents (PDF, DOCX, TXT, MD, and text-like files), lets you ask
 natural-language questions, and can save responses to Markdown or PDF for reporting and handoff.
 
 The project is designed to stay practical:
 - minimal setup
 - explicit backend/key handling
-- simple interactive workflow
+- CLI + web interactive workflow
 - test coverage around core behavior
 
 ## What It Does
@@ -39,6 +39,8 @@ Implementation files:
 - `src/pdf_utils.py`: document discovery + text extraction
 - `src/prompt_loader.py`: markdown prompt section parsing
 - `src/output_utils.py`: markdown/PDF output writing
+- `src/web_app.py`: FastAPI endpoints + streaming query SSE endpoint
+- `src/static/`: web UI assets
 - `tests/`: behavior checks for retrieval, prompts, and output generation
 
 ## Requirements
@@ -93,13 +95,19 @@ If `RLM_BACKEND` is omitted, the app auto-detects the first configured backend i
 
 1. Put one or more documents in `embed-docs/`.
    Supported types include `.pdf`, `.docx`, `.txt`, `.md`, and other text-like files.
-2. Run:
+2. Run CLI:
 
 ```bash
 uv run main.py
 ```
 
-3. Follow prompts:
+3. Or run web UI:
+
+```bash
+uv run main.py web
+```
+
+4. Follow CLI prompts:
    - choose a document by number
    - or choose `a` to load all documents in `embed-docs/`
    - choose model (or accept default)
@@ -114,6 +122,15 @@ After each answer, it prints run metrics (tokens, iterations, subagent calls, an
 If subagents are enabled but `Subagent Calls` is `0`, the run stayed on the root model only.
 Progress updates run in an isolated worker process to keep elapsed-time UI responsive during long calls.
 Press `Ctrl+C` during processing to cancel the active query cleanly without a traceback.
+
+## Web UI
+
+- Open `http://localhost:8000` after running `uv run main.py web`.
+- Query responses stream live from `/api/query/stream`.
+- Streaming logs are split into two panels:
+  - `Agent Output`: document loading, iteration/completion, and code execution events.
+  - `Subagent Output`: recursive subagent call prompt/response events.
+- Final answer and metrics are shown in the main chat once the run completes.
 
 ## Prompt File (`prompts.md`)
 

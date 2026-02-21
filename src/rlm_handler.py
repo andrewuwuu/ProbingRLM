@@ -1,9 +1,10 @@
 import os
 import rlm
 import time
-from typing import Optional
+from typing import Optional, Any
 from rlm.clients import get_client
 from rlm.utils.prompts import RLM_SYSTEM_PROMPT
+from rlm.logger.rlm_logger import RLMLogger
 
 API_KEY_ENV_BY_BACKEND = {
     "openai": "OPENAI_API_KEY",
@@ -20,14 +21,36 @@ STRICT_API_KEY_BACKENDS = {"anthropic", "portkey"}
 class _InMemoryRLMLogger:
     """Collect RLM iterations in memory so we can compute runtime metrics."""
 
-    def __init__(self) -> None:
+    def __init__(self, file_logger: Optional[Any] = None) -> None:
+        self.run_metadata = None
         self.iterations = []
+        self.file_logger = file_logger
 
     def log_metadata(self, metadata) -> None:
-        _ = metadata
+        self.run_metadata = metadata.to_dict() if hasattr(metadata, "to_dict") else metadata
+        if self.file_logger:
+            self.file_logger.log_metadata(metadata)
 
     def log(self, iteration) -> None:
         self.iterations.append(iteration)
+        if self.file_logger:
+            self.file_logger.log(iteration)
+
+    def clear_iterations(self) -> None:
+        self.iterations = []
+        if self.file_logger and hasattr(self.file_logger, "clear_iterations"):
+            self.file_logger.clear_iterations()
+
+    def get_trajectory(self):
+        if self.run_metadata is None:
+            return None
+        return {
+            "run_metadata": self.run_metadata,
+            "iterations": [
+                item.to_dict() if hasattr(item, "to_dict") else item
+                for item in self.iterations
+            ],
+        }
 
     @property
     def iteration_count(self) -> int:
@@ -37,8 +60,8 @@ class _InMemoryRLMLogger:
 class _GuardedRLMLogger(_InMemoryRLMLogger):
     """Logger that aborts the run when subagent-call budget is exceeded."""
 
-    def __init__(self, max_subagent_calls: int) -> None:
-        super().__init__()
+    def __init__(self, max_subagent_calls: int, file_logger: Optional[Any] = None) -> None:
+        super().__init__(file_logger=file_logger)
         self.max_subagent_calls = max_subagent_calls
         self.subagent_calls = 0
 
@@ -56,6 +79,10 @@ class _GuardedRLMLogger(_InMemoryRLMLogger):
                 f"Max subagent calls exceeded: {self.subagent_calls} > {self.max_subagent_calls}"
             )
 
+    def clear_iterations(self) -> None:
+        super().clear_iterations()
+        self.subagent_calls = 0
+
 
 class RLMHandler:
     def __init__(
@@ -63,10 +90,12 @@ class RLMHandler:
         backend: str = "openrouter",
         api_key: Optional[str] = None,
         verbose: bool = False,
+        log_dir: Optional[str] = None,
     ):
         self.backend = backend
         self.api_key = api_key
         self.verbose = verbose
+        self.log_dir = log_dir
         self.last_metrics: dict = {}
 
         # Ensure API key is set in environment for the backend to pick it up.
@@ -204,10 +233,12 @@ class RLMHandler:
             if max_subagent_calls is not None and max_subagent_calls <= 0:
                 raise ValueError("max_subagent_calls must be greater than 0 when provided.")
 
+            file_logger = RLMLogger(log_dir=self.log_dir) if self.log_dir else None
+
             tracker = (
-                _GuardedRLMLogger(max_subagent_calls=max_subagent_calls)
+                _GuardedRLMLogger(max_subagent_calls=max_subagent_calls, file_logger=file_logger)
                 if max_subagent_calls is not None
-                else _InMemoryRLMLogger()
+                else _InMemoryRLMLogger(file_logger=file_logger)
             )
             rlm_system_prompt = self._compose_rlm_system_prompt(
                 user_system_prompt=system_prompt,

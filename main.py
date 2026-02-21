@@ -1,3 +1,5 @@
+import argparse
+import os
 from typing import Callable
 
 from src.cli_app import (
@@ -25,11 +27,26 @@ def _should_continue_session(allow_follow_ups: bool, answered_queries: int) -> b
 
 
 def main() -> None:
-    run_cli_main(
-        prompt_yes_no=_prompt_yes_no,
-        prompt_query=_prompt_query,
-        should_continue_session=_should_continue_session,
-    )
+    parser = argparse.ArgumentParser(description="ProbingRLM: CLI and Web document retrieval.")
+    parser.add_argument("mode", nargs="?", choices=["cli", "web"], default="cli", help="Mode to run (default: cli).")
+    args = parser.parse_args()
+
+    if args.mode == "cli":
+        run_cli_main(
+            prompt_yes_no=_prompt_yes_no,
+            prompt_query=_prompt_query,
+            should_continue_session=_should_continue_session,
+        )
+    elif args.mode == "web":
+        import uvicorn
+        print("Starting web server on http://localhost:8000")
+        reload_enabled = os.getenv("PROBINGRLM_WEB_RELOAD", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        uvicorn.run("src.web_app:app", host="127.0.0.1", port=8000, reload=reload_enabled)
 
 
 if __name__ == "__main__":

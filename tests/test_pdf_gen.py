@@ -3,7 +3,6 @@ import sys
 import tempfile
 import unittest
 
-# Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.output_utils import save_markdown_response, save_pdf_response

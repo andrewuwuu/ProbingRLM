@@ -5,9 +5,12 @@ description = "CLI document retrieval tool built on the rlms library."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.129.0",
     "markdown-pdf>=1.11",
     "pypdf>=6.7.0",
     "python-docx>=1.2.0",
     "python-dotenv>=1.2.1",
-    "rlms>=0.1.0",
+    "python-multipart>=0.0.22",
+    "rlms>=0.1.1",
+    "uvicorn>=0.41.0",
 ]

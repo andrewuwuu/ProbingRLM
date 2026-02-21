@@ -22,18 +22,15 @@ def load_prompts(file_path: str) -> dict[str, str]:
                     if not header_text:
                         continue
 
-                    # Save previous section
                     if current_section:
                         prompts[current_section] = '\n'.join(current_content).strip()
 
-                    # Start new section
                     current_section = header_text
                     current_content = []
                 else:
                     if current_section:
                         current_content.append(line.rstrip())
-            
-            # Save last section
+
             if current_section:
                 prompts[current_section] = '\n'.join(current_content).strip()
 
