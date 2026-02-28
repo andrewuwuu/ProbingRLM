@@ -1,24 +1,24 @@
 # ProbingRLM
 
-`ProbingRLM` is a local document question-answering tool built on the `rlms` library.
-It loads local documents (PDF, DOCX, TXT, MD, and text-like files), lets you ask
-natural-language questions, and can save responses to Markdown or PDF for reporting and handoff.
+## About
+`ProbingRLM` is an elegant, local-first web and CLI application built on the `rlms` library. It enables you to securely load local technical documents (PDF, DOCX, TXT, MD) and interrogate them using Advanced Agentic Models (RLMs) or Direct LLM queries. It is a capable, transparent tool for research and technical handoff, providing granular real-time visibility into the reasoning process of Subagents and long-context processing (chunking, compaction, and provider fallbacks).
 
 The project is designed to stay practical:
-- minimal setup
-- explicit backend/key handling
-- CLI + web interactive workflow
-- test coverage around core behavior
+- **Minimal setup** with explicit backend/key handling.
+- **CLI + Modern Web UI** (SolidJS) interactive workflows.
+- **Real-time Streaming** visibility into iterative agent thought processes via Server-Sent Events (SSE).
+- Test coverage around core agentic and chunking behavior.
 
 ## What It Does
 
-- Scans `embed-docs/` for supported document files.
-- Extracts text from PDF, DOCX, and plain text files.
+- Scans `embed-docs/` for supported document files to extract their context.
 - Sends your query plus document context to an LLM via `rlms`.
-- Supports both direct LM mode and RLM subagent mode.
-- Auto-chunks oversized direct prompts to stay under model context limits.
+- **Live Streams Agent Activity:** Watch the underlying agent iterate, write code, and spin up subagents live in the Web UI.
+- Supports both **Direct LM Mode** for fast extraction and **Recursive Agent Mode (RLM Subagents)** for complex reasoning over multiple turns.
+- Automatically handles over-budget contexts by switching to **Adaptive Chunking** or provider-specific context tools like **OpenRouter Middle-Out Rescue**.
+- In Subagent Mode, uses **Root Compaction Guard** to prevent the primary agent from overflowing its context limit during long chains of thought.
 - Optionally loads reusable prompts from `prompts.md`.
-- Saves model outputs as `.md`, `.pdf`, or both.
+- Saves final outputs as `.md` or `.pdf` for documentation and reporting.
 
 ## How It Works
 
