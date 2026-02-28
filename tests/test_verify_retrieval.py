@@ -86,6 +86,7 @@ class TestPDFRetrieval(unittest.TestCase):
         mock_client = MagicMock()
         mock_client.completion.return_value = "Mocked Response"
         mock_client.model_name = "openai/gpt-4.1-mini"
+        mock_client.get_usage_summary.return_value = None
         mock_client.get_last_usage.return_value = SimpleNamespace(
             total_calls=1,
             total_input_tokens=120,
@@ -108,11 +109,18 @@ class TestPDFRetrieval(unittest.TestCase):
         self.assertEqual(handler.last_metrics["total_input_tokens"], 120)
         self.assertEqual(handler.last_metrics["total_output_tokens"], 45)
         self.assertEqual(handler.last_metrics["total_tokens"], 165)
+        self.assertFalse(handler.last_metrics["chunking"]["applied"])
 
     @patch("src.rlm_handler.get_client")
     def test_rlm_query_without_subagents_with_system_prompt(self, mock_get_client):
         mock_client = MagicMock()
         mock_client.completion.return_value = "Mocked Response"
+        mock_client.get_usage_summary.return_value = None
+        mock_client.get_last_usage.return_value = SimpleNamespace(
+            total_calls=1,
+            total_input_tokens=10,
+            total_output_tokens=4,
+        )
         mock_get_client.return_value = mock_client
 
         handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
@@ -123,6 +131,108 @@ class TestPDFRetrieval(unittest.TestCase):
         self.assertEqual(payload[0]["content"], "System instructions")
         self.assertEqual(payload[1]["role"], "user")
         self.assertIn("Prompt", payload[1]["content"])
+
+    @patch("src.rlm_handler.get_context_limit", return_value=2000)
+    @patch("src.rlm_handler.get_client")
+    def test_rlm_query_without_subagents_auto_chunks_large_context(
+        self,
+        mock_get_client,
+        _mock_get_context_limit,
+    ):
+        mock_client = MagicMock()
+        mock_client.model_name = "openai/gpt-4.1-mini"
+
+        def _completion_side_effect(payload):
+            text = payload if isinstance(payload, str) else payload[-1]["content"]
+            if "Extract only information that is directly relevant" in text:
+                return "chunk note"
+            if "Compress these notes into a shorter list" in text:
+                return "merged note"
+            return "Final synthesized answer"
+
+        mock_client.completion.side_effect = _completion_side_effect
+        mock_client.get_usage_summary.return_value = SimpleNamespace(
+            model_usage_summaries={
+                "openai/gpt-4.1-mini": SimpleNamespace(
+                    total_calls=5,
+                    total_input_tokens=400,
+                    total_output_tokens=120,
+                )
+            }
+        )
+        mock_get_client.return_value = mock_client
+
+        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+        large_context = "A" * 12000
+        response = handler.query(
+            "Summarize the content.",
+            large_context,
+            direct_chunk_overlap_tokens=0,
+            direct_chunk_max_chunks=32,
+            openrouter_middle_out_fallback=False,
+        )
+
+        self.assertEqual(response, "Final synthesized answer")
+        self.assertTrue(handler.last_metrics["chunking"]["enabled"])
+        self.assertTrue(handler.last_metrics["chunking"]["applied"])
+        self.assertEqual(
+            handler.last_metrics["chunking"]["strategy"],
+            "map_reduce_chunking",
+        )
+        self.assertGreater(handler.last_metrics["chunking"]["chunks_processed"], 1)
+
+    @patch("src.rlm_handler.get_context_limit", return_value=2000)
+    @patch("src.rlm_handler.get_client")
+    def test_rlm_query_without_subagents_uses_openrouter_middle_out_first(
+        self,
+        mock_get_client,
+        _mock_get_context_limit,
+    ):
+        mock_client = MagicMock()
+        mock_client.model_name = "openai/gpt-4.1-mini"
+        mock_client.client = MagicMock()
+        mock_client._track_cost = MagicMock()
+        mock_client.get_usage_summary.return_value = SimpleNamespace(
+            model_usage_summaries={
+                "openai/gpt-4.1-mini": SimpleNamespace(
+                    total_calls=1,
+                    total_input_tokens=140,
+                    total_output_tokens=30,
+                )
+            }
+        )
+
+        openrouter_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Middle-out answer"))],
+            usage=SimpleNamespace(
+                prompt_tokens=140,
+                completion_tokens=30,
+                total_tokens=170,
+                model_extra={},
+            ),
+        )
+        mock_client.client.chat.completions.create.return_value = openrouter_response
+        mock_get_client.return_value = mock_client
+
+        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+        large_context = "B" * 12000
+        response = handler.query(
+            "Answer from context.",
+            large_context,
+            openrouter_middle_out_fallback=True,
+        )
+
+        self.assertEqual(response, "Middle-out answer")
+        self.assertTrue(handler.last_metrics["chunking"]["middle_out_attempted"])
+        self.assertTrue(handler.last_metrics["chunking"]["middle_out_applied"])
+        self.assertEqual(
+            handler.last_metrics["chunking"]["strategy"],
+            "openrouter_middle_out",
+        )
+        self.assertTrue(handler.last_metrics["chunking"]["applied"])
+        mock_client.client.chat.completions.create.assert_called_once()
+        create_kwargs = mock_client.client.chat.completions.create.call_args.kwargs
+        self.assertEqual(create_kwargs.get("extra_body"), {"transforms": ["middle-out"]})
 
     @patch("src.rlm_handler.rlm.RLM")
     def test_rlm_query_with_subagents(self, mock_rlm_class):
@@ -167,6 +277,8 @@ class TestPDFRetrieval(unittest.TestCase):
         self.assertEqual(rlm_init.get("backend_kwargs", {}).get("model_name"), "openai/gpt-5-mini")
         self.assertEqual(rlm_init.get("max_depth"), 1)
         self.assertEqual(rlm_init.get("max_iterations"), 12)
+        self.assertTrue(rlm_init.get("compaction"))
+        self.assertEqual(rlm_init.get("compaction_threshold_pct"), 0.75)
         self.assertIn("SysPrompt", rlm_init.get("custom_system_prompt", ""))
         self.assertIn("Before FINAL, make at least one llm_query", rlm_init.get("custom_system_prompt", ""))
         self.assertEqual(rlm_init.get("other_backends"), ["openai"])
@@ -322,6 +434,32 @@ class TestPDFRetrieval(unittest.TestCase):
             "Before FINAL, make at least one llm_query",
             rlm_init.get("custom_system_prompt", ""),
         )
+        self.assertTrue(rlm_init.get("compaction"))
+        self.assertEqual(rlm_init.get("compaction_threshold_pct"), 0.75)
+
+    @patch("src.rlm_handler.rlm.RLM")
+    def test_rlm_query_with_subagents_compaction_can_be_disabled(self, mock_rlm_class):
+        mock_agent = MagicMock()
+        completion = MagicMock()
+        completion.response = "ok"
+        completion.execution_time = 0.3
+        completion.usage_summary = SimpleNamespace(model_usage_summaries={})
+        mock_agent.completion.return_value = completion
+        mock_rlm_class.return_value = mock_agent
+
+        handler = rlm_handler.RLMHandler(backend="openrouter", api_key="sk-test")
+        handler.query(
+            "Prompt",
+            "Context",
+            model="openai/gpt-5-mini",
+            use_subagents=True,
+            subagent_root_compaction_enabled=False,
+            subagent_compaction_threshold_pct=0.6,
+        )
+
+        rlm_init = mock_rlm_class.call_args.kwargs
+        self.assertFalse(rlm_init.get("compaction"))
+        self.assertEqual(rlm_init.get("compaction_threshold_pct"), 0.6)
 
     @patch("src.rlm_handler.get_client")
     @patch("src.rlm_handler.rlm.RLM")

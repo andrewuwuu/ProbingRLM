@@ -2,9 +2,11 @@ import os
 import time
 import multiprocessing as mp
 import queue
+from dataclasses import replace
 from typing import Callable
 from dotenv import load_dotenv
 
+from src.context_controls import ContextControls, context_controls_from_env
 from src.output_utils import save_markdown_response, save_pdf_response
 from src.pdf_utils import list_documents, load_document
 from src.prompt_loader import load_prompts
@@ -231,6 +233,47 @@ def default_should_continue_session(allow_follow_ups: bool, answered_queries: in
     return answered_queries < 1
 
 
+def _resolve_context_controls_for_cli(
+    prompt_yes_no: Callable[[str, bool], bool],
+) -> ContextControls:
+    controls = context_controls_from_env()
+    print(
+        "Large-context controls "
+        f"(chunking={controls.direct_chunking_enabled}, "
+        f"overlap={controls.direct_chunk_overlap_tokens}, "
+        f"max_chunks={controls.direct_chunk_max_chunks}, "
+        f"middle_out={controls.openrouter_middle_out_fallback}, "
+        f"subagent_compaction={controls.subagent_root_compaction_enabled}, "
+        f"subagent_threshold={controls.subagent_compaction_threshold_pct})"
+    )
+
+    if not prompt_yes_no("Customize context controls for this run? (y/N): ", default=False):
+        return controls
+
+    controls = replace(
+        controls,
+        direct_chunking_enabled=prompt_yes_no(
+            "Enable direct chunking fallback? (Y/n): ",
+            default=controls.direct_chunking_enabled,
+        ),
+    )
+    controls = replace(
+        controls,
+        openrouter_middle_out_fallback=prompt_yes_no(
+            "Enable OpenRouter middle-out fallback? (Y/n): ",
+            default=controls.openrouter_middle_out_fallback,
+        ),
+    )
+    controls = replace(
+        controls,
+        subagent_root_compaction_enabled=prompt_yes_no(
+            "Enable subagent root compaction protection? (Y/n): ",
+            default=controls.subagent_root_compaction_enabled,
+        ),
+    )
+    return controls
+
+
 def _run_query_with_live_status(handler: RLMHandler, query_kwargs: dict) -> str:
     result: dict[str, dict | str] = {}
     ctx = mp.get_context("spawn")
@@ -417,6 +460,7 @@ def main(
         print(f"RLM max subagent calls cap active: {max_subagent_calls}")
 
     use_subagents = prompt_yes_no("Use RLM subagents? (y/N): ", default=False)
+    context_controls = _resolve_context_controls_for_cli(prompt_yes_no)
     subagent_backend: str | None = None
     subagent_model: str | None = None
     if use_subagents:
@@ -505,6 +549,12 @@ def main(
             model=model_name,
             use_subagents=use_subagents,
             system_prompt=system_prompt,
+            direct_chunking_enabled=context_controls.direct_chunking_enabled,
+            direct_chunk_overlap_tokens=context_controls.direct_chunk_overlap_tokens,
+            direct_chunk_max_chunks=context_controls.direct_chunk_max_chunks,
+            openrouter_middle_out_fallback=context_controls.openrouter_middle_out_fallback,
+            subagent_root_compaction_enabled=context_controls.subagent_root_compaction_enabled,
+            subagent_compaction_threshold_pct=context_controls.subagent_compaction_threshold_pct,
             subagent_backend=subagent_backend,
             subagent_model=subagent_model,
             max_iterations=max_iterations,

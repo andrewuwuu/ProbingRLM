@@ -16,6 +16,7 @@ The project is designed to stay practical:
 - Extracts text from PDF, DOCX, and plain text files.
 - Sends your query plus document context to an LLM via `rlms`.
 - Supports both direct LM mode and RLM subagent mode.
+- Auto-chunks oversized direct prompts to stay under model context limits.
 - Optionally loads reusable prompts from `prompts.md`.
 - Saves model outputs as `.md`, `.pdf`, or both.
 
@@ -39,14 +40,18 @@ Implementation files:
 - `src/pdf_utils.py`: document discovery + text extraction
 - `src/prompt_loader.py`: markdown prompt section parsing
 - `src/output_utils.py`: markdown/PDF output writing
-- `src/web_app.py`: FastAPI endpoints + streaming query SSE endpoint
-- `src/static/`: web UI assets
+- `src/backend/app.py`: FastAPI app factory + static frontend mount
+- `src/backend/routes.py`: API routes (`/api/*`)
+- `src/backend/services.py`: query orchestration + SSE streaming backend logic
+- `src/web_app.py`: compatibility export for legacy imports
+- `frontend/`: SolidJS web app source (built to `frontend/dist`)
 - `tests/`: behavior checks for retrieval, prompts, and output generation
 
 ## Requirements
 
 - Python `>=3.11`
 - `uv` for dependency management
+- Node.js + `npm` for web build pipeline
 - Backend-specific credentials for the provider you use.
 
 ## Installation
@@ -75,6 +80,14 @@ RLM_SUBAGENT_MODEL=gpt-4.1-mini
 # Optional runtime safety guards (positive integers):
 RLM_MAX_ITERATIONS=20
 RLM_MAX_SUBAGENT_CALLS=40
+
+# Optional long-context controls:
+RLM_DIRECT_CHUNKING_ENABLED=true
+RLM_DIRECT_CHUNK_OVERLAP_TOKENS=256
+RLM_DIRECT_CHUNK_MAX_CHUNKS=64
+RLM_OPENROUTER_MIDDLE_OUT_FALLBACK=true
+RLM_SUBAGENT_ROOT_COMPACTION_ENABLED=true
+RLM_SUBAGENT_COMPACTION_THRESHOLD_PCT=0.75
 ```
 
 Supported backends:
@@ -107,6 +120,14 @@ uv run main.py
 uv run main.py web
 ```
 
+This command automatically builds `frontend/` before starting FastAPI.
+
+Alternative one-command flow (tests + frontend build + backend start):
+
+```bash
+./scripts/start_fullstack.sh
+```
+
 4. Follow CLI prompts:
    - choose a document by number
    - or choose `a` to load all documents in `embed-docs/`
@@ -126,7 +147,10 @@ Press `Ctrl+C` during processing to cancel the active query cleanly without a tr
 ## Web UI
 
 - Open `http://localhost:8000` after running `uv run main.py web`.
+- Frontend assets are compiled from SolidJS (`frontend/`) on web startup.
 - Query responses stream live from `/api/query/stream`.
+- Sidebar includes per-run toggles for direct chunking, OpenRouter middle-out retry,
+  and subagent root compaction behavior.
 - Streaming logs are split into two panels:
   - `Agent Output`: document loading, iteration/completion, and code execution events.
   - `Subagent Output`: recursive subagent call prompt/response events.
@@ -159,12 +183,30 @@ Parser behavior:
 - Sends a single completion request with prompt + context.
 - Faster and cheaper.
 - Good default for straightforward extraction/summarization tasks.
+- If prompt+context exceeds the model's token budget, it automatically switches to
+  map-reduce chunking (chunk summaries, then final synthesis) instead of failing.
+
+Chunking knobs for `/api/query` and `/api/query/stream` request bodies:
+- `direct_chunking_enabled` (default: `true`)
+- `direct_chunk_overlap_tokens` (default: `256`)
+- `direct_chunk_max_chunks` (default: `64`)
+- `openrouter_middle_out_fallback` (default: `true`)
+- `subagent_root_compaction_enabled` (default: `true`)
+- `subagent_compaction_threshold_pct` (default: `0.75`)
+
+How sizing works:
+- The handler estimates each model's context limit automatically and derives a per-request token budget.
+- `direct_chunk_max_chunks` is **not** token limit; it is only a safety cap on how many chunks may be generated.
+- Different OpenRouter models can have different context sizes; budget calculation adapts per selected model.
 
 ### RLM Subagent Mode (`use_subagents = true`)
 
 - Uses `rlm.RLM(..., max_depth=1)` with:
   - `prompt=context`
   - `root_prompt=user_question`
+- Adds root-history compaction protection by default:
+  - `compaction=True`
+  - `compaction_threshold_pct=0.75` (configurable)
 - Recursive `llm_query` calls still happen even when no alternate subagent model is configured.
   In that case, depth-1 calls run on the same root backend/model.
 - Supports optional separate subagent backend/model via:
@@ -227,6 +269,13 @@ Test coverage includes:
   - Try a stronger model, add a `System` prompt, or enable subagents.
 - Very long-running subagent sessions:
   - Set `RLM_MAX_ITERATIONS` and/or `RLM_MAX_SUBAGENT_CALLS` in `.env`.
+- `maximum context length` / OpenRouter 400 errors:
+  - Keep `direct_chunking_enabled=true` (default).
+  - Keep `openrouter_middle_out_fallback=true` to retry once with OpenRouter transform before chunking.
+  - In subagent mode, keep `subagent_root_compaction_enabled=true` and lower
+    `subagent_compaction_threshold_pct` (for example `0.65`) if root context still grows too large.
+  - Lower selected document count, or raise `direct_chunk_max_chunks` for very large corpora.
+  - For complex long-context reasoning, prefer `use_subagents=true` so RLM can work from REPL context instead of one giant prompt.
 
 ## Notes
 

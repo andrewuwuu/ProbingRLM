@@ -1,10 +1,19 @@
 import os
 import rlm
 import time
+from collections.abc import Callable
 from typing import Optional, Any
 from rlm.clients import get_client
 from rlm.utils.prompts import RLM_SYSTEM_PROMPT
+from rlm.utils.token_utils import count_tokens, get_context_limit
 from rlm.logger.rlm_logger import RLMLogger
+from src.context_controls import (
+    DEFAULT_DIRECT_CHUNK_OVERLAP_TOKENS,
+    DEFAULT_DIRECT_MAX_CHUNKS,
+    DEFAULT_OPENROUTER_MIDDLE_OUT_FALLBACK,
+    DEFAULT_SUBAGENT_ROOT_COMPACTION_ENABLED,
+    DEFAULT_SUBAGENT_COMPACTION_THRESHOLD_PCT,
+)
 
 API_KEY_ENV_BY_BACKEND = {
     "openai": "OPENAI_API_KEY",
@@ -16,6 +25,8 @@ API_KEY_ENV_BY_BACKEND = {
     "azure_openai": "AZURE_OPENAI_API_KEY",
 }
 STRICT_API_KEY_BACKENDS = {"anthropic", "portkey"}
+DEFAULT_DIRECT_OUTPUT_RESERVE_TOKENS = 4096
+MIN_DIRECT_CONTEXT_CHUNK_TOKENS = 512
 
 
 class _InMemoryRLMLogger:
@@ -82,6 +93,28 @@ class _GuardedRLMLogger(_InMemoryRLMLogger):
     def clear_iterations(self) -> None:
         super().clear_iterations()
         self.subagent_calls = 0
+
+
+class _StreamingRLM(rlm.RLM):
+    """RLM subclass that emits iteration-start events via a verbose override.
+
+    The upstream library accepts ``on_iteration_start`` / ``on_iteration_complete``
+    callbacks in its constructor but never invokes them during ``completion()``.
+    This subclass fills that gap by overriding ``_completion_turn`` to call
+    ``self.verbose.print_iteration_start()`` before each LM turn, and by
+    injecting the caller-provided verbose printer immediately after
+    construction so all verbose output goes through the SSE queue.
+    """
+
+    def __init__(self, *, verbose_override: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.verbose = verbose_override
+        self._turn_counter = 0
+
+    def _completion_turn(self, *args: Any, **kwargs: Any) -> Any:
+        self._turn_counter += 1
+        self.verbose.print_iteration_start(self._turn_counter)
+        return super()._completion_turn(*args, **kwargs)
 
 
 class RLMHandler:
@@ -174,10 +207,21 @@ class RLMHandler:
         model: Optional[str] = None,
         use_subagents: bool = False,
         system_prompt: Optional[str] = None,
+        direct_chunking_enabled: bool = True,
+        direct_chunk_overlap_tokens: int = DEFAULT_DIRECT_CHUNK_OVERLAP_TOKENS,
+        direct_chunk_max_chunks: int = DEFAULT_DIRECT_MAX_CHUNKS,
+        openrouter_middle_out_fallback: bool = DEFAULT_OPENROUTER_MIDDLE_OUT_FALLBACK,
+        subagent_root_compaction_enabled: bool = DEFAULT_SUBAGENT_ROOT_COMPACTION_ENABLED,
+        subagent_compaction_threshold_pct: float = DEFAULT_SUBAGENT_COMPACTION_THRESHOLD_PCT,
         subagent_backend: Optional[str] = None,
         subagent_model: Optional[str] = None,
         max_iterations: Optional[int] = None,
         max_subagent_calls: Optional[int] = None,
+        on_subcall_start: Callable | None = None,
+        on_subcall_complete: Callable | None = None,
+        on_iteration_start: Callable | None = None,
+        on_iteration_complete: Callable | None = None,
+        verbose_override: Any = None,
     ) -> str:
         """
         Query the model with prompt + context.
@@ -189,10 +233,24 @@ class RLMHandler:
             use_subagents: Whether to enable RLM recursion (max_depth=1).
                 When False, runs a direct LM completion (no RLM loop).
             system_prompt: Optional system prompt to guide the RLM.
+            direct_chunking_enabled: If True, automatically chunk oversized direct prompts.
+            direct_chunk_overlap_tokens: Approximate token overlap between direct chunks.
+            direct_chunk_max_chunks: Hard cap for direct chunk count before failing fast.
+            openrouter_middle_out_fallback: If True on OpenRouter, retry context overflows
+                with the OpenRouter "middle-out" transform before chunking.
+            subagent_root_compaction_enabled: Enables RLM root-history compaction in
+                subagent mode to prevent root prompt growth overflow.
+            subagent_compaction_threshold_pct: Fraction of model context at which RLM
+                compaction triggers (0.1 to 0.99).
             subagent_backend: Optional backend for recursive sub-calls.
             subagent_model: Optional model name for recursive sub-calls.
             max_iterations: Optional cap for RLM iterations (root loop).
             max_subagent_calls: Optional hard budget for cumulative llm_query calls.
+            on_subcall_start: Optional callback(depth, model, prompt_preview) for live subcall events.
+            on_subcall_complete: Optional callback(depth, model, duration, error_or_none) for live subcall events.
+            on_iteration_start: Optional callback(depth, iteration_num) for live iteration events.
+            on_iteration_complete: Optional callback(depth, iteration_num, duration) for live iteration events.
+            verbose_override: Optional VerbosePrinter-like object to replace agent.verbose after construction.
 
         Returns:
             The model's response.
@@ -208,24 +266,27 @@ class RLMHandler:
 
         tracker: _InMemoryRLMLogger | None = None
         try:
+            if direct_chunk_overlap_tokens < 0:
+                raise ValueError("direct_chunk_overlap_tokens must be >= 0.")
+            if direct_chunk_max_chunks <= 0:
+                raise ValueError("direct_chunk_max_chunks must be > 0.")
+            if not (0.1 <= subagent_compaction_threshold_pct <= 0.99):
+                raise ValueError(
+                    "subagent_compaction_threshold_pct must be between 0.1 and 0.99."
+                )
+
             if not use_subagents:
-                client = get_client(self.backend, backend_kwargs)
-                payload: str | list[dict[str, str]] = self._compose_single_pass_prompt(
-                    prompt, context
+                completion_text, direct_metrics = self._direct_completion_with_metrics(
+                    prompt=prompt,
+                    context=context,
+                    backend_kwargs=backend_kwargs,
+                    system_prompt=system_prompt,
+                    direct_chunking_enabled=direct_chunking_enabled,
+                    direct_chunk_overlap_tokens=direct_chunk_overlap_tokens,
+                    direct_chunk_max_chunks=direct_chunk_max_chunks,
+                    openrouter_middle_out_fallback=openrouter_middle_out_fallback,
                 )
-                if system_prompt:
-                    payload = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": payload},
-                    ]
-                start_time = time.perf_counter()
-                completion_text = str(client.completion(payload)).strip()
-                end_time = time.perf_counter()
-                self.last_metrics = self._build_direct_metrics(
-                    model_name=getattr(client, "model_name", model or "unknown"),
-                    model_usage=getattr(client, "get_last_usage", lambda: None)(),
-                    execution_time=end_time - start_time,
-                )
+                self.last_metrics = direct_metrics
                 return completion_text
 
             if max_iterations is not None and max_iterations <= 0:
@@ -244,16 +305,34 @@ class RLMHandler:
                 user_system_prompt=system_prompt,
                 subagent_model=subagent_model,
             )
-            agent = rlm.RLM(
-                **self._build_rlm_kwargs(
-                    backend_kwargs=backend_kwargs,
-                    system_prompt=rlm_system_prompt,
-                    subagent_backend=subagent_backend,
-                    subagent_model=subagent_model,
-                    max_iterations=max_iterations,
-                    logger=tracker,
-                )
+            rlm_kwargs = self._build_rlm_kwargs(
+                backend_kwargs=backend_kwargs,
+                system_prompt=rlm_system_prompt,
+                subagent_backend=subagent_backend,
+                subagent_model=subagent_model,
+                max_iterations=max_iterations,
+                logger=tracker,
+                on_subcall_start=on_subcall_start,
+                on_subcall_complete=on_subcall_complete,
+                on_iteration_start=on_iteration_start,
+                on_iteration_complete=on_iteration_complete,
+                subagent_root_compaction_enabled=subagent_root_compaction_enabled,
+                subagent_compaction_threshold_pct=subagent_compaction_threshold_pct,
             )
+
+            # When using verbose_override, tell the RLM constructor NOT to
+            # create its own VerbosePrinter(enabled=True).  The constructor
+            # calls self.verbose.print_metadata() during __init__, which would
+            # print rich panels to the terminal before we get a chance to
+            # override.  Setting verbose=False here prevents that; our
+            # custom verbose_override handles all output via the SSE queue.
+            if verbose_override is not None:
+                rlm_kwargs["verbose"] = False
+
+            if verbose_override is not None:
+                agent = _StreamingRLM(verbose_override=verbose_override, **rlm_kwargs)
+            else:
+                agent = rlm.RLM(**rlm_kwargs)
 
             completions = []
             completion = agent.completion(prompt=context, root_prompt=prompt)
@@ -284,6 +363,10 @@ class RLMHandler:
                     context=context,
                     backend_kwargs=backend_kwargs,
                     system_prompt=system_prompt,
+                    direct_chunking_enabled=direct_chunking_enabled,
+                    direct_chunk_overlap_tokens=direct_chunk_overlap_tokens,
+                    direct_chunk_max_chunks=direct_chunk_max_chunks,
+                    openrouter_middle_out_fallback=openrouter_middle_out_fallback,
                 )
 
             self.last_metrics = self._build_subagent_metrics(
@@ -347,6 +430,12 @@ class RLMHandler:
         subagent_model: Optional[str],
         max_iterations: Optional[int],
         logger,
+        on_subcall_start: Callable | None = None,
+        on_subcall_complete: Callable | None = None,
+        on_iteration_start: Callable | None = None,
+        on_iteration_complete: Callable | None = None,
+        subagent_root_compaction_enabled: bool = DEFAULT_SUBAGENT_ROOT_COMPACTION_ENABLED,
+        subagent_compaction_threshold_pct: float = DEFAULT_SUBAGENT_COMPACTION_THRESHOLD_PCT,
     ) -> dict:
         rlm_kwargs = {
             "backend": self.backend,
@@ -355,9 +444,20 @@ class RLMHandler:
             "custom_system_prompt": system_prompt,
             "verbose": self.verbose,
             "logger": logger,
+            "compaction": subagent_root_compaction_enabled,
+            "compaction_threshold_pct": subagent_compaction_threshold_pct,
         }
         if max_iterations is not None:
             rlm_kwargs["max_iterations"] = max_iterations
+
+        if on_subcall_start is not None:
+            rlm_kwargs["on_subcall_start"] = on_subcall_start
+        if on_subcall_complete is not None:
+            rlm_kwargs["on_subcall_complete"] = on_subcall_complete
+        if on_iteration_start is not None:
+            rlm_kwargs["on_iteration_start"] = on_iteration_start
+        if on_iteration_complete is not None:
+            rlm_kwargs["on_iteration_complete"] = on_iteration_complete
 
         if bool(subagent_backend) != bool(subagent_model):
             raise ValueError(
@@ -435,6 +535,8 @@ class RLMHandler:
             return {}
 
         model_usage = getattr(usage_summary, "model_usage_summaries", {}) or {}
+        if not isinstance(model_usage, dict):
+            return {}
         converted = {}
         for model_name, usage in model_usage.items():
             converted[model_name] = self._model_usage_to_dict(usage)
@@ -451,23 +553,344 @@ class RLMHandler:
         )
         return total_input, total_output
 
+    @staticmethod
+    def _payload_messages(payload: str | list[dict[str, str]]) -> list[dict[str, str]]:
+        if isinstance(payload, str):
+            return [{"role": "user", "content": payload}]
+        return payload
+
+    def _payload_token_count(self, payload: str | list[dict[str, str]], model_name: str) -> int:
+        return count_tokens(self._payload_messages(payload), model_name)
+
+    @staticmethod
+    def _is_context_limit_error(error: Exception) -> bool:
+        lower = str(error).lower()
+        return "maximum context length" in lower or "context length" in lower
+
+    def _collect_client_model_usage(self, client, model_name: str) -> dict:
+        usage_summary_fn = getattr(client, "get_usage_summary", None)
+        if callable(usage_summary_fn):
+            try:
+                model_usage = self._usage_summary_to_dict(usage_summary_fn())
+                if model_usage:
+                    return model_usage
+            except Exception:
+                pass
+
+        return {
+            model_name: self._model_usage_to_dict(
+                getattr(client, "get_last_usage", lambda: None)()
+            )
+        }
+
+    def _completion_with_middle_out(
+        self,
+        client,
+        payload: str | list[dict[str, str]],
+        model_name: str,
+    ) -> str:
+        raw_client = getattr(client, "client", None)
+        if raw_client is None:
+            raise ValueError("OpenRouter middle-out fallback is unavailable for this client.")
+
+        response = raw_client.chat.completions.create(
+            model=model_name,
+            messages=self._payload_messages(payload),
+            extra_body={"transforms": ["middle-out"]},
+        )
+
+        track_cost = getattr(client, "_track_cost", None)
+        if callable(track_cost):
+            track_cost(response, model_name)
+
+        content = response.choices[0].message.content
+        return str(content or "").strip()
+
     def _build_direct_metrics(
         self,
-        model_name: str,
-        model_usage,
+        model_usage: dict,
         execution_time: float | None,
+        chunking: Optional[dict] = None,
     ) -> dict:
-        usage = self._model_usage_to_dict(model_usage)
-        total_input, total_output = self._totals_from_model_usage({model_name: usage})
+        total_input, total_output = self._totals_from_model_usage(model_usage)
         return {
             "mode": "direct_lm",
             "execution_time": execution_time,
             "iterations": 0,
             "subagent_calls": 0,
-            "model_usage": {model_name: usage},
+            "model_usage": model_usage,
             "total_input_tokens": total_input,
             "total_output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            "chunking": chunking or {"enabled": False, "applied": False},
+        }
+
+    @staticmethod
+    def _split_text_for_chunk_budget(
+        text: str,
+        chunk_tokens: int,
+        overlap_tokens: int,
+    ) -> list[str]:
+        if not text.strip():
+            return [""]
+
+        chars_per_token = 4
+        chunk_chars = max(1024, chunk_tokens * chars_per_token)
+        overlap_chars = max(0, overlap_tokens * chars_per_token)
+        parts: list[str] = []
+        start = 0
+        text_len = len(text)
+
+        while start < text_len:
+            end = min(text_len, start + chunk_chars)
+            if end < text_len:
+                search_floor = max(start + int(chunk_chars * 0.6), start)
+                split_at = text.rfind("\n\n", search_floor, end)
+                if split_at < 0:
+                    split_at = text.rfind("\n", search_floor, end)
+                if split_at > start:
+                    end = split_at
+
+            part = text[start:end].strip()
+            if part:
+                parts.append(part)
+
+            if end >= text_len:
+                break
+
+            next_start = max(end - overlap_chars, start + 1)
+            if next_start <= start:
+                next_start = end
+            start = next_start
+
+        return parts or [text]
+
+    @staticmethod
+    def _split_text_in_half(text: str) -> tuple[str, str]:
+        if len(text) < 2:
+            return text, ""
+        mid = len(text) // 2
+        split_at = text.rfind("\n\n", 0, mid)
+        if split_at < 0:
+            split_at = text.rfind("\n", 0, mid)
+        if split_at <= 0:
+            split_at = mid
+        left = text[:split_at].strip()
+        right = text[split_at:].strip()
+        return left, right
+
+    @staticmethod
+    def _compose_chunk_analysis_prompt(question: str, chunk: str, chunk_index: int, total_chunks: int) -> str:
+        return (
+            f"Question:\n{question}\n\n"
+            f"Document chunk {chunk_index} of {total_chunks}:\n{chunk}\n\n"
+            "Extract only information that is directly relevant to answering the question. "
+            "Return concise bullet points. If this chunk has no relevant information, return exactly "
+            "'NO_RELEVANT_INFO'."
+        )
+
+    @staticmethod
+    def _compose_chunk_merge_prompt(question: str, notes: str) -> str:
+        return (
+            f"Question:\n{question}\n\n"
+            "Chunk notes:\n"
+            f"{notes}\n\n"
+            "Compress these notes into a shorter list of only information needed to answer the question. "
+            "Preserve concrete facts and numbers."
+        )
+
+    def _group_notes_by_budget(
+        self,
+        notes: list[str],
+        model_name: str,
+        max_tokens: int,
+    ) -> list[str]:
+        if not notes:
+            return []
+        groups: list[str] = []
+        current: list[str] = []
+        for note in notes:
+            candidate = "\n\n".join(current + [note])
+            candidate_tokens = count_tokens(
+                [{"role": "user", "content": candidate}],
+                model_name,
+            )
+            if current and candidate_tokens > max_tokens:
+                groups.append("\n\n".join(current))
+                current = [note]
+            else:
+                current.append(note)
+        if current:
+            groups.append("\n\n".join(current))
+        return groups
+
+    def _direct_completion_chunked(
+        self,
+        client,
+        prompt: str,
+        context: str,
+        system_prompt: Optional[str],
+        model_name: str,
+        allowed_input_tokens: int,
+        direct_chunk_overlap_tokens: int,
+        direct_chunk_max_chunks: int,
+    ) -> tuple[str, dict]:
+        chunk_overhead_payload: str | list[dict[str, str]] = self._compose_chunk_analysis_prompt(
+            question=prompt,
+            chunk="",
+            chunk_index=1,
+            total_chunks=1,
+        )
+        if system_prompt:
+            chunk_overhead_payload = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": chunk_overhead_payload},
+            ]
+
+        chunk_overhead_tokens = self._payload_token_count(chunk_overhead_payload, model_name)
+        chunk_token_budget = max(
+            MIN_DIRECT_CONTEXT_CHUNK_TOKENS,
+            allowed_input_tokens - chunk_overhead_tokens - 256,
+        )
+
+        pending_chunks = self._split_text_for_chunk_budget(
+            text=context,
+            chunk_tokens=chunk_token_budget,
+            overlap_tokens=direct_chunk_overlap_tokens,
+        )
+        if len(pending_chunks) > direct_chunk_max_chunks:
+            raise ValueError(
+                f"Context requires {len(pending_chunks)} chunks which exceeds "
+                f"direct_chunk_max_chunks={direct_chunk_max_chunks}. Reduce documents or "
+                "enable retrieval before query."
+            )
+
+        notes: list[str] = []
+        processed_chunks = 0
+        while pending_chunks:
+            chunk = pending_chunks.pop(0)
+            if not chunk.strip():
+                continue
+
+            total_chunks = processed_chunks + len(pending_chunks) + 1
+            chunk_prompt = self._compose_chunk_analysis_prompt(
+                question=prompt,
+                chunk=chunk,
+                chunk_index=processed_chunks + 1,
+                total_chunks=total_chunks,
+            )
+            chunk_payload: str | list[dict[str, str]] = chunk_prompt
+            if system_prompt:
+                chunk_payload = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": chunk_prompt},
+                ]
+
+            if self._payload_token_count(chunk_payload, model_name) > allowed_input_tokens:
+                left, right = self._split_text_in_half(chunk)
+                if right:
+                    pending_chunks = [left, right] + pending_chunks
+                    if len(pending_chunks) > direct_chunk_max_chunks:
+                        raise ValueError(
+                            "Adaptive chunk splitting exceeded direct_chunk_max_chunks. "
+                            "Reduce document size or increase chunk limit."
+                        )
+                    continue
+
+            try:
+                note = str(client.completion(chunk_payload)).strip()
+            except Exception as error:
+                if self._is_context_limit_error(error):
+                    left, right = self._split_text_in_half(chunk)
+                    if right:
+                        pending_chunks = [left, right] + pending_chunks
+                        if len(pending_chunks) > direct_chunk_max_chunks:
+                            raise ValueError(
+                                "Adaptive chunk splitting exceeded direct_chunk_max_chunks. "
+                                "Reduce document size or increase chunk limit."
+                            ) from error
+                        continue
+                raise
+
+            processed_chunks += 1
+            if note and note != "NO_RELEVANT_INFO":
+                notes.append(f"[Chunk {processed_chunks}] {note}")
+
+        if not notes:
+            notes = ["No directly relevant evidence was found in the provided documents."]
+
+        final_context = "\n\n".join(notes)
+        final_payload: str | list[dict[str, str]] = self._compose_single_pass_prompt(
+            prompt, final_context
+        )
+        if system_prompt:
+            final_payload = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_payload},
+            ]
+
+        while (
+            self._payload_token_count(final_payload, model_name) > allowed_input_tokens
+            and len(notes) > 1
+        ):
+            merge_overhead_payload: str | list[dict[str, str]] = self._compose_chunk_merge_prompt(
+                question=prompt,
+                notes="",
+            )
+            if system_prompt:
+                merge_overhead_payload = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": merge_overhead_payload},
+                ]
+            merge_overhead_tokens = self._payload_token_count(
+                merge_overhead_payload, model_name
+            )
+            merge_note_budget = max(
+                MIN_DIRECT_CONTEXT_CHUNK_TOKENS,
+                allowed_input_tokens - merge_overhead_tokens - 256,
+            )
+            grouped_notes = self._group_notes_by_budget(
+                notes=notes,
+                model_name=model_name,
+                max_tokens=merge_note_budget,
+            )
+            if len(grouped_notes) >= len(notes):
+                break
+
+            merged_notes: list[str] = []
+            for group in grouped_notes:
+                merge_prompt = self._compose_chunk_merge_prompt(question=prompt, notes=group)
+                merge_payload: str | list[dict[str, str]] = merge_prompt
+                if system_prompt:
+                    merge_payload = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": merge_prompt},
+                    ]
+                merged_note = str(client.completion(merge_payload)).strip()
+                if merged_note:
+                    merged_notes.append(merged_note)
+
+            if not merged_notes:
+                break
+            notes = merged_notes
+            final_context = "\n\n".join(notes)
+            final_payload = self._compose_single_pass_prompt(prompt, final_context)
+            if system_prompt:
+                final_payload = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": final_payload},
+                ]
+
+        completion_text = str(client.completion(final_payload)).strip()
+        return completion_text, {
+            "enabled": True,
+            "applied": True,
+            "strategy": "map_reduce_chunking",
+            "chunks_processed": processed_chunks,
+            "chunk_overlap_tokens": direct_chunk_overlap_tokens,
+            "chunk_token_budget": chunk_token_budget,
+            "model_context_limit": get_context_limit(model_name),
+            "allowed_input_tokens": allowed_input_tokens,
         }
 
     def _direct_completion_with_metrics(
@@ -476,6 +899,10 @@ class RLMHandler:
         context: str,
         backend_kwargs: dict[str, str],
         system_prompt: Optional[str],
+        direct_chunking_enabled: bool = True,
+        direct_chunk_overlap_tokens: int = DEFAULT_DIRECT_CHUNK_OVERLAP_TOKENS,
+        direct_chunk_max_chunks: int = DEFAULT_DIRECT_MAX_CHUNKS,
+        openrouter_middle_out_fallback: bool = DEFAULT_OPENROUTER_MIDDLE_OUT_FALLBACK,
     ) -> tuple[str, dict]:
         client = get_client(self.backend, backend_kwargs)
         payload: str | list[dict[str, str]] = self._compose_single_pass_prompt(
@@ -486,13 +913,109 @@ class RLMHandler:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": payload},
             ]
+
+        model_name = getattr(client, "model_name", backend_kwargs.get("model_name", "unknown"))
+        model_context_limit = get_context_limit(model_name)
+        output_reserve = min(
+            DEFAULT_DIRECT_OUTPUT_RESERVE_TOKENS,
+            max(1024, model_context_limit // 8),
+        )
+        allowed_input_tokens = max(
+            MIN_DIRECT_CONTEXT_CHUNK_TOKENS,
+            model_context_limit - output_reserve,
+        )
+        prompt_tokens = self._payload_token_count(payload, model_name)
+        can_try_middle_out = (
+            openrouter_middle_out_fallback
+            and self.backend == "openrouter"
+            and hasattr(client, "client")
+        )
+
         start_time = time.perf_counter()
-        completion_text = str(client.completion(payload)).strip()
+        chunking = {
+            "enabled": bool(direct_chunking_enabled),
+            "applied": False,
+            "strategy": "single_pass",
+            "model_context_limit": model_context_limit,
+            "allowed_input_tokens": allowed_input_tokens,
+            "estimated_prompt_tokens": prompt_tokens,
+            "middle_out_enabled": bool(can_try_middle_out),
+            "middle_out_attempted": False,
+            "middle_out_applied": False,
+        }
+
+        def _run_chunked() -> tuple[str, dict]:
+            chunked_text, chunked_meta = self._direct_completion_chunked(
+                client=client,
+                prompt=prompt,
+                context=context,
+                system_prompt=system_prompt,
+                model_name=model_name,
+                allowed_input_tokens=allowed_input_tokens,
+                direct_chunk_overlap_tokens=direct_chunk_overlap_tokens,
+                direct_chunk_max_chunks=direct_chunk_max_chunks,
+            )
+            chunked_meta["middle_out_enabled"] = bool(can_try_middle_out)
+            chunked_meta["middle_out_attempted"] = chunking.get("middle_out_attempted", False)
+            chunked_meta["middle_out_applied"] = False
+            return chunked_text, chunked_meta
+
+        if prompt_tokens > allowed_input_tokens:
+            if can_try_middle_out:
+                chunking["middle_out_attempted"] = True
+                try:
+                    completion_text = self._completion_with_middle_out(
+                        client=client,
+                        payload=payload,
+                        model_name=model_name,
+                    )
+                    chunking["applied"] = True
+                    chunking["strategy"] = "openrouter_middle_out"
+                    chunking["middle_out_applied"] = True
+                except Exception as error:
+                    if not self._is_context_limit_error(error):
+                        raise
+                    if not direct_chunking_enabled:
+                        raise
+                    completion_text, chunking = _run_chunked()
+            elif direct_chunking_enabled:
+                completion_text, chunking = _run_chunked()
+            else:
+                completion_text = str(client.completion(payload)).strip()
+        else:
+            try:
+                completion_text = str(client.completion(payload)).strip()
+            except Exception as error:
+                if not self._is_context_limit_error(error):
+                    raise
+
+                if can_try_middle_out:
+                    chunking["middle_out_attempted"] = True
+                    try:
+                        completion_text = self._completion_with_middle_out(
+                            client=client,
+                            payload=payload,
+                            model_name=model_name,
+                        )
+                        chunking["applied"] = True
+                        chunking["strategy"] = "openrouter_middle_out"
+                        chunking["middle_out_applied"] = True
+                    except Exception as middle_out_error:
+                        if not self._is_context_limit_error(middle_out_error):
+                            raise
+                        if not direct_chunking_enabled:
+                            raise
+                        completion_text, chunking = _run_chunked()
+                elif direct_chunking_enabled:
+                    completion_text, chunking = _run_chunked()
+                else:
+                    raise
         end_time = time.perf_counter()
+
         metrics = self._build_direct_metrics(
-            model_name=getattr(client, "model_name", backend_kwargs.get("model_name", "unknown")),
-            model_usage=getattr(client, "get_last_usage", lambda: None)(),
+            model_usage=self._collect_client_model_usage(client, model_name),
             execution_time=end_time - start_time,
+            chunking=chunking,
         )
         return completion_text, metrics
 
@@ -502,12 +1025,20 @@ class RLMHandler:
         context: str,
         backend_kwargs: dict[str, str],
         system_prompt: Optional[str],
+        direct_chunking_enabled: bool = True,
+        direct_chunk_overlap_tokens: int = DEFAULT_DIRECT_CHUNK_OVERLAP_TOKENS,
+        direct_chunk_max_chunks: int = DEFAULT_DIRECT_MAX_CHUNKS,
+        openrouter_middle_out_fallback: bool = DEFAULT_OPENROUTER_MIDDLE_OUT_FALLBACK,
     ) -> tuple[str, dict]:
         text, metrics = self._direct_completion_with_metrics(
             prompt=prompt,
             context=context,
             backend_kwargs=backend_kwargs,
             system_prompt=system_prompt,
+            direct_chunking_enabled=direct_chunking_enabled,
+            direct_chunk_overlap_tokens=direct_chunk_overlap_tokens,
+            direct_chunk_max_chunks=direct_chunk_max_chunks,
+            openrouter_middle_out_fallback=openrouter_middle_out_fallback,
         )
         prefixed = (
             "[Recovered after RLM FINAL_VAR failure using direct completion]\n\n"
